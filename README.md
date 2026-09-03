@@ -1,0 +1,119 @@
+# Signal — three-layer AI trading app
+
+An initial, functional **paper-trading** vertical slice built around the three requested projects.
+The product model is market-agnostic: every run selects a market, venue, account mode and symbol.
+
+## Start the app on macOS
+
+Signal now includes a local installable web app. It serves the interface and the Python
+pipeline together, so results are never replaced with browser-side sample data.
+
+The interface follows a staged workflow instead of placing everything on one screen:
+
+1. Choose a market.
+2. Explore its searchable universe, breadth, top gainers, top losers and the clearly
+   labelled Signal Fear & Greed calculation.
+3. Open AI Scores to rank the available assets by trend, mood, liquidity and risk.
+4. Open one asset for the full TradingAgents debate, deterministic risk decision and
+   optional Paperclip audit event.
+
+```bash
+cd ~/Downloads/ai-trading-bot
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -e '.[dev,upstreams]'
+cp .env.example .env
+open -a TextEdit .env
+signal-app
+```
+
+Add one supported LLM provider key to `.env`. Start OpenBB and Paperclip locally and
+set their URLs in the same file. Signal opens at `http://127.0.0.1:8787` and its
+system-check panel shows which layers still need setup. Chrome can install that page
+as a standalone app.
+
+The web app calls `/api/analyze`, which executes the real pipeline:
+
+1. The selected OpenBB or WEEX adapter obtains a current market snapshot.
+2. `TradingAgentsGraph.propagate()` produces the research decision.
+3. The deterministic local risk engine approves or blocks a paper order intent.
+4. Paperclip receives the completed event when its task bridge is configured.
+
+Paperclip can also run the complete pipeline through its HTTP adapter. Point the
+adapter to `http://127.0.0.1:8787/api/paperclip/analyze` and give it the header
+`Authorization: Bearer <your PAPERCLIP_BRIDGE_TOKEN>`. The endpoint accepts the
+standard Paperclip run envelope and reads optional `symbol`, `market`, `venue`, and
+`equity` values from `context`; otherwise it uses the safe defaults in `.env`.
+
+If a required upstream is missing or misconfigured, the app returns a visible setup
+error. It does not manufacture a fallback signal.
+
+| Layer | Upstream | Responsibility |
+|---|---|---|
+| Data | OpenBB | Point-in-time prices, fundamentals, macro and news inputs |
+| Intelligence | TradingAgents | Multi-agent research and a BUY/SELL/HOLD proposal |
+| Control plane | Paperclip | Schedules, agent work, budgets, approvals and audit visibility |
+| Safety boundary | This project | Deterministic risk checks and broker execution |
+
+## Market and venue selection
+
+Current registry choices are:
+
+| Market | Venue | Status |
+|---|---|---|
+| Crypto spot | WEEX V3 | Public live data; execution intentionally paper-only |
+| Crypto futures | WEEX V3 | Mark-price data, symbols, signed demo orders and reconciliation |
+| Equities | OpenBB | Data adapter available |
+| Forex | OpenBB | Registry/data route available |
+| Commodities | OpenBB | Registry/data route available |
+| Options | OpenBB | Registry/data route available |
+
+Spot and futures remain separate adapters because WEEX exposes them through different
+domains and schemas. Additional venues can register implementations without modifying
+the strategy or risk engine.
+
+The AI only creates a `TradeSignal`. A separate deterministic risk engine creates an
+`OrderIntent`, and only the broker adapter can execute it. Version 0.2 ships with a
+stateful in-memory paper broker and no live-order adapter.
+
+The WEEX demo broker signs V3 requests, uses only `/capi/v3/sim/*`, requires an attached
+stop loss, rejects duplicate client order IDs, reconciles positions before every order,
+caps configured leverage at 5x, and permits isolated margin only. Exit-only sizing is
+enforced locally because the documented demo order schema does not expose `reduceOnly`.
+That race-sensitive limitation is another reason live execution remains unavailable.
+
+## Run locally
+
+Python 3.11 or 3.12 is recommended.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev,upstreams]'
+cp .env.example .env
+pytest
+tradebot BTCUSDT --market crypto_futures --venue weex --date 2026-09-01 --equity 100000
+```
+
+OpenBB must be reachable at `OPENBB_API_URL` (default `http://127.0.0.1:6900`).
+TradingAgents requires an enabled LLM provider key. Paperclip reporting is disabled
+unless `PAPERCLIP_TASK_BRIDGE_URL` and its scoped key are explicitly configured.
+
+## Safety gates before any live broker
+
+1. Immutable event/audit storage and idempotency keys.
+2. Point-in-time backtests with fees, spread and slippage.
+3. Walk-forward and out-of-sample evaluation against a simple benchmark.
+4. Persistent positions, reconciliation, market-hours checks and stale-data rejection.
+5. Kill switch, daily-loss circuit breaker, exposure/concentration limits and manual approval.
+6. Broker sandbox soak test, then tiny-notional canary. Never hand an LLM broker credentials.
+
+For WEEX specifically, use a separate IP-allowlisted API key with only the required
+trade permission, no withdrawal capability, and begin with the futures simulation API.
+
+## Licensing
+
+Pinned revisions are listed in `UPSTREAMS.lock`. TradingAgents is Apache-2.0 and
+Paperclip is MIT. OpenBB is AGPL-3.0-only; this design consumes OpenBB across a
+service/API boundary. Deployment and distribution obligations should be reviewed by
+qualified counsel. This software is experimental and is not investment advice.

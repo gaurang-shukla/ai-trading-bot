@@ -1,0 +1,5 @@
+# Audited 2026-09-02. Update deliberately and rerun the contract tests.
+TradingAgents https://github.com/TauricResearch/TradingAgents.git 9dee508c44662702281a8dbaad1f7b42179b5ba7 Apache-2.0 v0.4.0
+Paperclip https://github.com/paperclipai/paperclip.git 5716fe907e596ce73501408fc6efdb19fb61edf2 MIT v0.3.1
+OpenBB https://github.com/OpenBB-finance/OpenBB.git 3e071fcc2cd9f891cac6040ae60296dba76dab46 AGPL-3.0-only v4.7.3
+
