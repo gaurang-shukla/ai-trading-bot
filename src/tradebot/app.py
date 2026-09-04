@@ -326,11 +326,23 @@ def create_app() -> FastAPI:
             result.update({"live_price": snapshot.price, "change_24h": snapshot.change_24h,
                            "volume": snapshot.volume, "source": snapshot.source,
                            "last_updated": snapshot.as_of})
-            chart_bars = histories.get("1h") or histories.get("15m") or next(
-                (bars for bars in histories.values() if bars), [])
-            result["chart_points"] = [
-                {"timestamp": bar.timestamp, "close": bar.close} for bar in chart_bars[-80:]
-            ]
+            # Send the candles already fetched for signal generation to the client.
+            # This makes timeframe changes instant and avoids a second provider call.
+            result["chart_timeframes"] = {
+                frame: [
+                    {"timestamp": bar.timestamp, "open": bar.open, "high": bar.high,
+                     "low": bar.low, "close": bar.close, "volume": bar.volume}
+                    for bar in bars[-80:]
+                ]
+                for frame, bars in histories.items() if bars
+            }
+            default_frame = next((frame for frame in ("1h", "15m", "5m", "4h", "1d", "1m")
+                                  if result["chart_timeframes"].get(frame)), None)
+            result["chart_default_timeframe"] = default_frame
+            # Keep the original close-only field for older clients.
+            result["chart_points"] = ([{"timestamp": bar["timestamp"], "close": bar["close"]}
+                                       for bar in result["chart_timeframes"][default_frame]]
+                                      if default_frame else [])
             if warnings:
                 result["warnings"] = warnings
             result["notice"] = "Deterministic quick signal only. No AI or live order was used."
@@ -363,7 +375,8 @@ def create_app() -> FastAPI:
             merged = {**quick, **deep, "quick_signal": quick}
             for key in ("live_price", "change_24h", "volume", "source", "last_updated",
                         "timeframe_breakdown", "key_levels", "trend_summary",
-                        "momentum_summary", "volatility_summary", "chart_points"):
+                        "momentum_summary", "volatility_summary", "chart_points",
+                        "chart_timeframes", "chart_default_timeframe"):
                 merged[key] = quick.get(key)
             progress(5, "Finalizing decision")
             result = normalize_deep_reasoning(merged, quick)
