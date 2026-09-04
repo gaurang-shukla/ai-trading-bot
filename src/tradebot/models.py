@@ -42,6 +42,18 @@ class MarketSnapshot:
 
 
 @dataclass(frozen=True)
+class Candle:
+    """Provider-neutral OHLCV bar (volume is optional for FX/index feeds)."""
+
+    timestamp: int | str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float | None = None
+
+
+@dataclass(frozen=True)
 class TradeSignal:
     symbol: str
     side: Side

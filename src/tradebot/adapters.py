@@ -10,7 +10,7 @@ from typing import Protocol
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from .models import MarketSnapshot, Side, TradeSignal
+from .models import Candle, MarketSnapshot, Side, TradeSignal
 from .diagnostics import diagnostics
 
 
@@ -31,6 +31,7 @@ def research_symbol(symbol: str) -> str:
 
 class MarketData(Protocol):
     def snapshot(self, symbol: str) -> MarketSnapshot: ...
+    def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]: ...
 
 
 class SignalProvider(Protocol):
@@ -60,6 +61,16 @@ class OpenBBClient:
         volume = row.get("volume") or row.get("regular_market_volume")
         return MarketSnapshot(symbol.upper(), float(price), row.get("last_trade_timestamp", date.today().isoformat()),
                               "OpenBB", _optional_float(change), _optional_float(volume))
+
+    def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
+        # OpenBB deployments differ in provider coverage. This standard endpoint is
+        # attempted first; FallbackMarketData transparently moves to Yahoo if absent.
+        params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
+        url = f"{self.base_url}/api/v1/{self.asset_class}/price/historical?{urlencode(params)}"
+        with urlopen(url, timeout=float(os.getenv("MARKET_DATA_TIMEOUT_SECONDS", "0.9"))) as response:
+            payload = json.load(response)
+        rows = payload if isinstance(payload, list) else payload.get("results", payload.get("data", []))
+        return _rows_to_candles(rows)[-limit:]
 
     def option_chain(self, symbol: str, expiration: str | None = None) -> dict:
         params = {"symbol": symbol.upper()}
@@ -109,6 +120,26 @@ class YahooFinanceClient:
         return MarketSnapshot(symbol.upper(), float(price), timestamp, "Yahoo Finance", change,
                               float(volumes[-1]) if volumes else None)
 
+    def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
+        yahoo_interval, history = _yahoo_interval(interval)
+        url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+               f"{quote(symbol, safe='')}?{urlencode({'interval': yahoo_interval, 'range': history})}")
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0 Signal/0.5"})
+        with urlopen(request, timeout=float(os.getenv("MARKET_DATA_TIMEOUT_SECONDS", "0.9"))) as response:
+            payload = json.load(response)
+        results = payload.get("chart", {}).get("result") or []
+        if not results:
+            raise ValueError(f"Yahoo Finance returned no candles for {symbol}")
+        chart = results[0]
+        quote_data = (chart.get("indicators", {}).get("quote") or [{}])[0]
+        rows = []
+        for index, timestamp in enumerate(chart.get("timestamp") or []):
+            row = {"timestamp": timestamp}
+            row.update({key: (values[index] if index < len(values) else None)
+                        for key, values in quote_data.items()})
+            rows.append(row)
+        return _rows_to_candles(rows)[-limit:]
+
 
 class NormalizedMarketData:
     """Query a research provider with its symbol while retaining the WEEX identity."""
@@ -121,6 +152,9 @@ class NormalizedMarketData:
         return MarketSnapshot(symbol.upper(), result.price, result.as_of, result.source,
                               result.change_24h, result.volume, result.funding_rate,
                               result.volatility_24h)
+
+    def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
+        return self.provider.candles(research_symbol(symbol), interval, limit)
 
 
 class FallbackMarketData:
@@ -144,6 +178,18 @@ class FallbackMarketData:
                 logger.warning("%s provider failed: %s", symbol.upper(), reason)
                 errors.append(reason)
         raise RuntimeError("; ".join(errors) or "no market data providers configured")
+
+    def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
+        errors = []
+        for provider in self.providers:
+            try:
+                bars = provider.candles(symbol, interval, limit)
+                if bars:
+                    return bars
+                raise ValueError("empty candle response")
+            except Exception as exc:
+                errors.append(f"{type(provider).__name__}: {exc}")
+        raise RuntimeError("; ".join(errors))
 
 
 class _WeexPublicClient:
@@ -178,6 +224,11 @@ class WeexSpotMarketData(_WeexPublicClient):
         payload = self._get("/api/v3/market/ticker/24hr", {})
         return payload if isinstance(payload, list) else [payload]
 
+    def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
+        payload = self._get("/api/v3/market/klines", {"symbol": symbol.upper(),
+                            "interval": interval, "limit": str(limit)})
+        return _weex_candles(payload)
+
 
 class WeexFuturesMarketData(_WeexPublicClient):
     base_url = "https://api-contract.weex.com"
@@ -200,6 +251,11 @@ class WeexFuturesMarketData(_WeexPublicClient):
     def tickers(self) -> list[dict]:
         payload = self._get("/capi/v3/market/ticker/24hr", {})
         return payload if isinstance(payload, list) else [payload]
+
+    def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
+        payload = self._get("/capi/v3/market/klines", {"symbol": symbol.upper(),
+                            "interval": interval, "limit": str(limit)})
+        return _weex_candles(payload)
 
 
 class TradingAgentsClient:
@@ -366,6 +422,44 @@ def _optional_float(value) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _rows_to_candles(rows: list) -> list[Candle]:
+    bars = []
+    for row in rows or []:
+        try:
+            if not isinstance(row, dict):
+                continue
+            values = [row.get(key) for key in ("open", "high", "low", "close")]
+            if any(value is None for value in values):
+                continue
+            bars.append(Candle(row.get("timestamp") or row.get("date") or row.get("datetime") or "",
+                               *(float(value) for value in values), _optional_float(row.get("volume"))))
+        except (TypeError, ValueError):
+            continue
+    return bars
+
+
+def _weex_candles(payload: dict | list) -> list[Candle]:
+    rows = payload.get("data", payload.get("result", [])) if isinstance(payload, dict) else payload
+    bars = []
+    for row in rows or []:
+        try:
+            if isinstance(row, dict):
+                bars.extend(_rows_to_candles([row]))
+            elif len(row) >= 5:
+                bars.append(Candle(row[0], float(row[1]), float(row[2]), float(row[3]),
+                                   float(row[4]), _optional_float(row[5]) if len(row) > 5 else None))
+        except (TypeError, ValueError):
+            continue
+    # APIs commonly return newest first; indicators require chronological input.
+    return sorted(bars, key=lambda bar: int(bar.timestamp) if str(bar.timestamp).isdigit() else str(bar.timestamp))
+
+
+def _yahoo_interval(interval: str) -> tuple[str, str]:
+    mapping = {"1m": ("1m", "7d"), "5m": ("5m", "60d"), "15m": ("15m", "60d"),
+               "1h": ("60m", "1y"), "4h": ("1h", "1y"), "1d": ("1d", "2y")}
+    return mapping.get(interval, ("1d", "2y"))
 
 
 def _ticker_volatility(row: dict) -> float | None:
