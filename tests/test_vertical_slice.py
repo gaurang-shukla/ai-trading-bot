@@ -177,4 +177,5 @@ def test_openai_failure_keeps_live_market_data_visible():
 
 def test_non_crypto_markets_are_exposed_through_openbb():
     choices = default_registry().choices()
-    assert {item["market"] for item in choices} >= {"equities", "forex", "commodities", "options"}
+    assert {item["market"] for item in choices} >= {"equities", "forex", "commodities"}
+    assert "options" not in {item["market"] for item in choices}

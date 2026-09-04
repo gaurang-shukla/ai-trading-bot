@@ -32,7 +32,7 @@ def test_app_shell_and_status_are_available():
     assert set(debug.json()) == {"openai", "tradingagents", "openbb", "weex", "yahoo", "paperclip"}
     assert debug.headers["cache-control"] == "no-store"
     assert "last_success" in debug.json()["openai"]
-    assert "last_traceback" in debug.json()["openai"]
+    assert "last_traceback" not in debug.json()["openai"]
 
 
 def test_debug_bypasses_frontend_and_service_worker(capsys):
@@ -48,11 +48,12 @@ def test_debug_bypasses_frontend_and_service_worker(capsys):
         assert label in output
 
 
-def test_debug_returns_the_complete_last_traceback():
+def test_debug_returns_the_complete_last_traceback_only_when_enabled(monkeypatch):
     try:
         raise RuntimeError("diagnostic failure")
     except RuntimeError as exc:
         diagnostics.failure("tradingagents", exc)
+    monkeypatch.setenv("SIGNAL_DEBUG", "true")
     body = client.get("/debug").json()["tradingagents"]
     assert body["last_error"] == "RuntimeError: diagnostic failure"
     assert "raise RuntimeError(\"diagnostic failure\")" in body["last_traceback"]
