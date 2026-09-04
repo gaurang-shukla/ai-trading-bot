@@ -3,7 +3,7 @@ import os
 import secrets
 import json
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
@@ -17,7 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
-from .analysis import CandleCache, DeepAnalysisCache, QuickSignalEngine, TIMEFRAMES
+from .analysis import (CandleCache, DeepAnalysisCache, QuickSignalEngine, TIMEFRAMES,
+                       normalize_deep_reasoning)
 from .assets import asset_metadata, public_metadata
 from .banknifty_options import NSEOptionChainClient, UNAVAILABLE_MESSAGE, build_chain
 from .diagnostics import diagnostics
@@ -38,6 +39,21 @@ signals = TradingAgentsClient()
 quick_signals = QuickSignalEngine()
 deep_cache = DeepAnalysisCache()
 candle_cache = CandleCache()
+
+
+def _debug_enabled() -> bool:
+    return os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _provider_failure_category(*errors: Exception) -> str:
+    text = " ".join(str(error).lower() for error in errors)
+    if any(word in text for word in ("blocked", "forbidden", "403", "unauthorized", "401")):
+        return "blocked by data source"
+    if any(word in text for word in ("empty", "no usable", "no banknifty", "no option")):
+        return "no option chain returned"
+    if any(word in text for word in ("market closed", "stale")):
+        return "market closed / stale data"
+    return "provider unavailable"
 
 
 class AnalyzeRequest(BaseModel):
@@ -217,9 +233,15 @@ def create_app() -> FastAPI:
                 spot = raw["underlying_price"]
             except Exception as nse_exc:
                 diagnostics.failure("nse", nse_exc)
-                return {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
+                category = _provider_failure_category(exc, nse_exc)
+                result = {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
                         "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
-                        "research_only": True}
+                        "research_only": True, "provider_attempts": {"openbb": True, "nse_fallback": True},
+                        "failure_category": category}
+                if _debug_enabled():
+                    result["provider_errors"] = {"openbb": f"{type(exc).__name__}: {exc}",
+                                                 "nse_fallback": f"{type(nse_exc).__name__}: {nse_exc}"}
+                return result
         result = build_chain(raw, spot, expiry, option_type, moneyness)
         # Filters may legitimately select no contracts while the provider remains available.
         result["available"] = True
@@ -321,9 +343,34 @@ def create_app() -> FastAPI:
 
     @app.post("/api/analyze/deep")
     def deep_analyze(request: DeepAnalyzeRequest):
-        return deep_cache.get_or_run(
-            request.market.value, request.symbol,
-            lambda: run_deep_analysis(request), refresh=request.refresh)
+        def bounded_run():
+            timeout = max(0.01, float(os.getenv("SIGNAL_DEEP_AI_TIMEOUT_SECONDS", "90")))
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deep-ai")
+            future = executor.submit(run_deep_analysis, request)
+            try:
+                deep = future.result(timeout=timeout)
+            except FutureTimeoutError as exc:
+                future.cancel()
+                quick = quick_analyze(request)
+                quick.update({"ai_available": False, "timed_out": True,
+                    "ai_notice": "Deep AI took too long, so the app is showing the deterministic Quick Signal summary instead. You can retry Deep AI later."})
+                if _debug_enabled():
+                    quick["debug_error"] = f"Deep AI timeout after {timeout:g} seconds: {type(exc).__name__}"
+                return quick
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+            if deep.get("ai_available") is False:
+                return deep
+            quick = quick_analyze(request)
+            merged = {**quick, **deep, "quick_signal": quick}
+            for key in ("live_price", "change_24h", "volume", "source", "last_updated",
+                        "timeframe_breakdown", "key_levels", "trend_summary",
+                        "momentum_summary", "volatility_summary"):
+                merged[key] = quick.get(key)
+            return normalize_deep_reasoning(merged, quick)
+
+        return deep_cache.get_or_run(request.market.value, request.symbol, bounded_run,
+                                     refresh=request.refresh)
 
     @app.post("/api/paperclip/analyze")
     def paperclip_analyze(payload: PaperclipRunRequest, authorization: str = Header(default="")):

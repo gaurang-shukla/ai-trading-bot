@@ -31,6 +31,25 @@ def test_unavailable_provider_state_does_not_crash_or_return_fake_rows():
     assert response.json()["message"] == "Bank Nifty options data provider not configured yet."
     assert response.json()["contracts"] == []
     assert response.json()["available"] is False
+    assert response.json()["provider_attempts"] == {"openbb": True, "nse_fallback": True}
+    assert response.json()["failure_category"] == "blocked by data source"
+    assert "provider_errors" not in response.json()
+
+
+def test_banknifty_raw_provider_errors_require_debug(monkeypatch):
+    monkeypatch.setenv("SIGNAL_DEBUG", "true")
+    with (patch("tradebot.app.OpenBBClient.option_chain", side_effect=RuntimeError("private openbb detail")),
+          patch("tradebot.app.NSEOptionChainClient.option_chain", side_effect=RuntimeError("private nse detail"))):
+        payload = client.get("/api/banknifty-options").json()
+    assert "private openbb detail" in payload["provider_errors"]["openbb"]
+    assert "private nse detail" in payload["provider_errors"]["nse_fallback"]
+
+
+def test_banknifty_ui_renders_attempt_metadata():
+    javascript = client.get("/assets/app.js").text
+    assert "OpenBB tried:" in javascript
+    assert "NSE fallback tried:" in javascript
+    assert "Failure category:" in javascript
 
 
 def test_openbb_empty_response_triggers_nse_fallback():
