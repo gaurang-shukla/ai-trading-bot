@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .adapters import PaperclipReporter, TradingAgentsClient
+from .config import load_project_env
 from .execution import PaperBroker
 from .models import MarketKind, MarketSelection
 from .overview import market_overview
@@ -23,19 +24,7 @@ from .venues import default_registry
 WEB_DIR = Path(__file__).with_name("web")
 
 
-def load_local_env(path: Path = Path(".env")) -> None:
-    """Load the project's local settings without ever printing credential values."""
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-load_local_env()
+load_project_env()
 
 
 class AnalyzeRequest(BaseModel):
@@ -55,27 +44,40 @@ class PaperclipRunRequest(BaseModel):
 
 def integration_status() -> dict:
     paperclip = PaperclipReporter()
+    openbb_configured = bool(os.getenv("OPENBB_API_URL"))
+    tradingagents_installed = importlib.util.find_spec("tradingagents") is not None
+    tradingagents_configured = any(os.getenv(key) for key in (
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
+        "GROQ_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"))
+    # PAPERCLIP_API_URL identifies the upstream service but does not provide an
+    # authenticated path in either direction.  Signal is ready to integrate only
+    # when Paperclip can call its protected endpoint, or when Signal can report to
+    # an authenticated task bridge.
+    paperclip_configured = bool(os.getenv("PAPERCLIP_BRIDGE_TOKEN") or paperclip.configured)
     return {
         "openbb": {
-            "installed": importlib.util.find_spec("openbb") is not None,
-            "configured": bool(os.getenv("OPENBB_API_URL")),
+            # OpenBB is consumed as a service, so its Python package need not be local.
+            "installed": True,
+            "configured": openbb_configured,
+            "ready": openbb_configured,
             "role": "normalized market research",
         },
         "tradingagents": {
-            "installed": importlib.util.find_spec("tradingagents") is not None,
-            "configured": any(os.getenv(key) for key in (
-                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
-                "GROQ_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY")),
+            "installed": tradingagents_installed,
+            "configured": tradingagents_configured,
+            "ready": tradingagents_installed and tradingagents_configured,
             "role": "multi-agent market decision",
         },
         "paperclip": {
             "installed": True,
-            "configured": bool(os.getenv("PAPERCLIP_BRIDGE_TOKEN")) or paperclip.configured,
+            "configured": paperclip_configured,
+            "ready": paperclip_configured,
             "role": "audit and orchestration bridge",
         },
         "weex": {
             "installed": True,
             "configured": True,
+            "ready": True,
             "demo_credentials": all(os.getenv(key) for key in (
                 "WEEX_API_KEY", "WEEX_SECRET_KEY", "WEEX_PASSPHRASE")),
             "role": "crypto prices and demo execution",

@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .config import load_project_env
 from .models import ExecutionReport, Side
 
 
@@ -22,6 +23,7 @@ class WeexCredentials:
 
     @classmethod
     def from_env(cls):
+        load_project_env()
         values = (os.getenv("WEEX_API_KEY", ""), os.getenv("WEEX_SECRET_KEY", ""),
                   os.getenv("WEEX_PASSPHRASE", ""))
         if not all(values):
@@ -152,5 +154,5 @@ class WeexDemoFuturesBroker:
 
 
 def live_execution_enabled() -> bool:
-    # Both flags are required by design; no live broker exists in this release.
-    return os.getenv("TRADING_MODE") == "live" and os.getenv("WEEX_LIVE_ENABLED", "").lower() == "true"
+    """Live execution is unavailable; this release is unconditionally paper-first."""
+    return False
