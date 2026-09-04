@@ -14,8 +14,9 @@ The interface follows a staged workflow instead of placing everything on one scr
 2. Explore its searchable universe, breadth, top gainers, top losers and the clearly
    labelled Signal Fear & Greed calculation.
 3. Open AI Scores to rank the available assets by trend, mood, liquidity and risk.
-4. Open one asset for an immediate, deterministic Quick Signal. Start the slower
-   TradingAgents debate only with **Run Deep AI Research**.
+4. Open one asset for an immediate, deterministic Quick Signal, then optionally ask
+   for its Fast AI Explanation. Start the slower second opinion only with
+   **Advanced Deep Research Report**.
 
 ```bash
 cd ~/Downloads/ai-trading-bot
@@ -37,10 +38,13 @@ The Analyse page separates the two pipelines:
 1. `POST /api/analyze/quick` obtains a live OpenBB or WEEX snapshot and applies local
    momentum, volatility, liquidity, funding and risk rules. It never loads
    TradingAgents or calls an LLM.
-2. `POST /api/analyze/deep` runs `TradingAgentsGraph.propagate()` only after explicit
+2. `POST /api/analyze/summary` directly calls the configured LLM with a compact prompt
+   to explain (and never replace) the Quick Signal. It falls back to deterministic
+   reasoning after its 15-second deadline.
+3. `POST /api/analyze/deep` runs `TradingAgentsGraph.propagate()` only after explicit
    user action. Successful results are cached for 20 minutes by market and symbol;
    send `refresh: true` to deliberately replace one.
-3. AI failures are displayed separately, leaving the Quick Signal and market data on
+4. AI failures are displayed separately, leaving the Quick Signal and market data on
    screen. Paperclip receives completed deep events when its task bridge is configured.
 
 Paperclip can also run the complete pipeline through its HTTP adapter. Point the

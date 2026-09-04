@@ -297,7 +297,8 @@ class TradingAgentsClient:
                         provider, key_name, key_loaded)
             if not key_loaded:
                 raise RuntimeError(f"{key_name or provider + ' API key'} is not configured")
-            model = os.getenv("OPENAI_MODEL", "") or str(config.get("quick_think_llm") or "gpt-4o-mini")
+            model = (os.getenv("SIGNAL_DEEP_AI_FAST_MODEL", "") or os.getenv("OPENAI_MODEL", "")
+                     or str(config.get("quick_think_llm") or "gpt-4o-mini"))
             if provider == "openai":
                 config["quick_think_llm"] = model
                 config["deep_think_llm"] = os.getenv("OPENAI_DEEP_MODEL", "") or model
@@ -341,10 +342,12 @@ class TradingAgentsClient:
 def _bounded_tradingagents_config(config: dict) -> dict:
     """Apply conservative output/debate limits without mutating package defaults."""
     bounded = config.copy()
-    max_tokens = min(600, max(100, int(os.getenv("TRADINGAGENTS_MAX_TOKENS", "550"))))
+    max_tokens = min(4000, max(100, int(os.getenv(
+        "SIGNAL_DEEP_AI_MAX_TOKENS", os.getenv("TRADINGAGENTS_MAX_TOKENS", "1200")))))
+    rounds = max(1, int(os.getenv("SIGNAL_DEEP_AI_MAX_ROUNDS", "1")))
     bounded["max_tokens"] = max_tokens
-    bounded["max_debate_rounds"] = min(int(bounded.get("max_debate_rounds", 1)), 1)
-    bounded["max_risk_discuss_rounds"] = min(int(bounded.get("max_risk_discuss_rounds", 1)), 1)
+    bounded["max_debate_rounds"] = min(int(bounded.get("max_debate_rounds", rounds)), rounds)
+    bounded["max_risk_discuss_rounds"] = min(int(bounded.get("max_risk_discuss_rounds", rounds)), rounds)
     for key in ("llm_kwargs", "model_kwargs"):
         values = dict(bounded.get(key) or {})
         values["max_tokens"] = max_tokens

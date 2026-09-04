@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 import uuid
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import asdict
 from datetime import datetime, timezone
 from math import log10
 from typing import Callable
+from urllib.request import Request, urlopen
 
 from .indicators import atr, bollinger_bands, ema, last, macd, rsi, support_resistance, vwap
 from .models import Candle, MarketSnapshot, Side, TradeSignal
@@ -22,6 +25,87 @@ HOLD_EXPLANATION = (
     "Because this is HOLD, the app is not suggesting a new entry. Watch resistance for a "
     "possible bullish breakout and support for possible downside risk."
 )
+
+
+class QuickResultCache:
+    """Keep the most recent Quick Signal so optional AI never refetches its data."""
+
+    def __init__(self, ttl_seconds: float | None = None):
+        self.ttl_seconds = ttl_seconds or float(os.getenv("QUICK_RESULT_CACHE_TTL_SECONDS", "60"))
+        self._values: dict[tuple[str, str], tuple[float, dict]] = {}
+        self._lock = threading.Lock()
+
+    def put(self, market: str, symbol: str, result: dict) -> None:
+        with self._lock:
+            self._values[(market, symbol.upper())] = (time.monotonic(), deepcopy(result))
+
+    def get(self, market: str, symbol: str) -> dict | None:
+        with self._lock:
+            value = self._values.get((market, symbol.upper()))
+            if not value or time.monotonic() - value[0] >= self.ttl_seconds:
+                return None
+            return deepcopy(value[1])
+
+
+def deterministic_fast_explanation(quick: dict) -> tuple[str, str]:
+    """Produce a useful explanation without AI while preserving the one main signal."""
+    signal, plan = quick.get("signal", {}), quick.get("risk_plan", {})
+    raw_action = signal.get("side") or plan.get("action") or "HOLD"
+    action = str(getattr(raw_action, "value", raw_action)).upper()
+    rows = quick.get("timeframe_breakdown") or []
+    confirmed = ", ".join(
+        f"{row.get('timeframe')} {str(row.get('trend', 'neutral')).lower()} "
+        f"(RSI {row.get('rsi', 'n/a')}, MACD {row.get('macd', 'n/a')}, EMA bias {row.get('ema_bias', 'n/a')})"
+        for row in rows
+    ) or "candle confirmation is unavailable, so the live-price rules carry more weight"
+    levels = quick.get("key_levels") or {}
+    active = plan.get("has_active_trade_setup", action != "HOLD")
+    trade = (f"Stop loss {plan.get('stop_loss')}; take profit {plan.get('take_profit')}; "
+             if active else "No new entry is suggested while the signal is HOLD; ")
+    watch = (f"Watch resistance {levels.get('resistance')} for a stronger upside confirmation and "
+             f"support {levels.get('support')} for invalidation or downside confirmation. "
+             "A change in timeframe alignment, RSI, MACD, or EMA bias can strengthen or invalidate the setup.")
+    explanation = (
+        f"Quick Signal is {action}; this explanation does not create a second signal. "
+        f"{quick.get('plain_language_reason') or signal.get('rationale') or 'The deterministic rules set the action.'} "
+        f"Timeframe confirmation: {confirmed}. Live price is {quick.get('live_price')}; "
+        f"support is {levels.get('support')} and resistance is {levels.get('resistance')}. "
+        f"{trade}risk score {plan.get('risk_score')} and position size "
+        f"{plan.get('position_size_pct', 0)} of equity. {watch}"
+    )
+    return explanation, watch
+
+
+class FastAIExplainer:
+    """A single compact OpenAI-compatible request that explains, never replaces, Quick Signal."""
+
+    def explain(self, quick: dict) -> str:
+        key = os.getenv("OPENAI_API_KEY", "")
+        if not key:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+        fallback, _ = deterministic_fast_explanation(quick)
+        compact = {key: quick.get(key) for key in (
+            "live_price", "change_24h", "trend_summary", "momentum_summary",
+            "volatility_summary", "timeframe_breakdown", "key_levels", "risk_plan")}
+        compact["main_signal"] = quick.get("signal")
+        prompt = (
+            "Explain the supplied Quick Signal in clear, concise trading language. The Quick Signal action is "
+            "authoritative: do not recommend or output a different BUY/SELL/HOLD action. Cover timeframe "
+            "confirmation, RSI, MACD, EMA bias, price context, support/resistance, risk plan, and what would "
+            "strengthen or invalidate it.\nDATA=" + json.dumps(compact, default=str, separators=(",", ":")))
+        url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+        payload = {"model": os.getenv("SIGNAL_FAST_AI_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                   "messages": [{"role": "system", "content": "Explain the existing signal only."},
+                                {"role": "user", "content": prompt}],
+                   "temperature": 0.2, "max_tokens": 500}
+        request = Request(url, data=json.dumps(payload).encode(), method="POST",
+                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+        timeout = max(.01, float(os.getenv("SIGNAL_FAST_AI_TIMEOUT_SECONDS", "15")))
+        with urlopen(request, timeout=timeout) as response:
+            data = json.load(response)
+        text = str(data["choices"][0]["message"]["content"]).strip()
+        # A one-word or otherwise unusably terse answer is expanded deterministically.
+        return text if len(text.split()) >= 12 else f"{text.rstrip('.')} — {fallback}"
 
 
 def ensure_risk_plan(result: dict) -> dict:
@@ -344,7 +428,7 @@ class DeepJobRegistry:
     def _execute(self, job_id: str, runner: Callable, fallback: Callable[[], dict]) -> None:
         self._update(job_id, status="running", progress_step=1,
                      progress_message=self.STEPS[0])
-        timeout = max(.01, float(os.getenv("SIGNAL_DEEP_AI_TIMEOUT_SECONDS", "90")))
+        timeout = max(.01, float(os.getenv("SIGNAL_DEEP_AI_TIMEOUT_SECONDS", "180")))
         inner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deep-ai-work")
         future = inner.submit(runner, lambda step, message: self._progress(job_id, step, message))
         try:
@@ -353,10 +437,10 @@ class DeepJobRegistry:
                          progress_message=self.STEPS[-1], result=result,
                          completed_at=self._now(), completed_monotonic=time.monotonic())
         except FutureTimeoutError as exc:
-            message = "Deep AI reached its backend time limit. Quick Signal remains available."
+            message = "Advanced Deep Research reached its backend time limit. Quick Signal remains available."
             self._terminal_error(job_id, "timed_out", message, exc, fallback)
         except Exception as exc:
-            message = "Deep AI could not complete. Quick Signal remains available."
+            message = "Advanced Deep Research could not complete. Quick Signal remains available."
             self._terminal_error(job_id, "failed", message, exc, fallback)
         finally:
             # Running provider calls cannot safely be killed; do not block this worker.

@@ -13,14 +13,16 @@ class TradingService:
         self.data, self.signals, self.risk, self.broker = data, signals, risk, broker
         self.reporter = reporter
 
-    def run(self, symbol: str, as_of: str, equity: float) -> dict:
+    def run(self, symbol: str, as_of: str, equity: float,
+            market: MarketSnapshot | None = None) -> dict:
         exchange_symbol = symbol.upper()
         errors = []
-        try:
-            market = self.data.snapshot(exchange_symbol)
-        except Exception as exc:
-            errors.append(f"Market data unavailable: {type(exc).__name__}: {exc}")
-            market = MarketSnapshot(exchange_symbol, 0.0, datetime.now(timezone.utc).isoformat(), "unavailable")
+        if market is None:
+            try:
+                market = self.data.snapshot(exchange_symbol)
+            except Exception as exc:
+                errors.append(f"Market data unavailable: {type(exc).__name__}: {exc}")
+                market = MarketSnapshot(exchange_symbol, 0.0, datetime.now(timezone.utc).isoformat(), "unavailable")
         try:
             signal = self.signals.analyze(exchange_symbol, as_of)
         except Exception as exc:

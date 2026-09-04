@@ -17,14 +17,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
-from .analysis import (CandleCache, DeepJobRegistry, QuickSignalEngine, TIMEFRAMES,
+from .analysis import (CandleCache, DeepJobRegistry, FastAIExplainer, QuickResultCache,
+                       QuickSignalEngine, TIMEFRAMES, deterministic_fast_explanation,
                        normalize_deep_reasoning)
 from .assets import asset_metadata, public_metadata
 from .banknifty_options import NSEOptionChainClient, UNAVAILABLE_MESSAGE, build_chain
 from .diagnostics import diagnostics
 from .config import load_project_env
 from .execution import PaperBroker
-from .models import MarketKind, MarketSelection
+from .models import MarketKind, MarketSelection, MarketSnapshot
 from .overview import market_overview
 from .risk import RiskEngine, RiskLimits
 from .service import TradingService
@@ -39,6 +40,8 @@ signals = TradingAgentsClient()
 quick_signals = QuickSignalEngine()
 deep_jobs = DeepJobRegistry()
 candle_cache = CandleCache()
+quick_results = QuickResultCache()
+fast_ai = FastAIExplainer()
 
 
 def _debug_enabled() -> bool:
@@ -279,10 +282,11 @@ def create_app() -> FastAPI:
         selection = MarketSelection(request.market, request.venue, request.symbol.upper())
         return default_registry().market_data(selection)
 
-    def run_deep_analysis(request: AnalyzeRequest):
+    def run_deep_analysis(request: AnalyzeRequest, quick: dict | None = None):
         try:
             provider = market_data(request)
-            if request.market is MarketKind.INDIAN_INDICES or request.symbol.upper().endswith(".NS"):
+            if ((request.market is MarketKind.INDIAN_INDICES or request.symbol.upper().endswith(".NS"))
+                    and not (quick or {}).get("chart_timeframes")):
                 try:
                     bars = provider.candles(request.symbol.upper(), "1d", 60)
                     if len(bars) < 20:
@@ -298,7 +302,10 @@ def create_app() -> FastAPI:
                 PaperBroker(request.equity),
                 PaperclipReporter(),
             )
-            result = service.run(request.symbol, request.as_of, request.equity)
+            market = None
+            if quick and quick.get("market"):
+                market = MarketSnapshot(**quick["market"])
+            result = service.run(request.symbol, request.as_of, request.equity, market=market)
             result["integrations"] = integration_status()
             result["notice"] = "Research and paper-risk decision only. No live order was placed."
             result.update(public_metadata(request.market, request.symbol))
@@ -369,6 +376,7 @@ def create_app() -> FastAPI:
             if warnings:
                 result["warnings"] = warnings
             result["notice"] = "Deterministic quick signal only. No AI or live order was used."
+            quick_results.put(request.market.value, symbol, result)
             return result
         except Exception as exc:
             if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
@@ -381,17 +389,41 @@ def create_app() -> FastAPI:
                 detail = "Live market data is temporarily unavailable. Try again later."
             raise HTTPException(502, detail) from exc
 
+    @app.post("/api/analyze/summary")
+    def summary_analyze(request: AnalyzeRequest):
+        """Quick Signal's optional fast explanation, with a deterministic timeout fallback."""
+        quick = (quick_results.get(request.market.value, request.symbol)
+                 or quick_analyze(request))
+        explanation, watch = deterministic_fast_explanation(quick)
+        fallback_used = False
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fast-ai")
+        future = executor.submit(fast_ai.explain, quick)
+        try:
+            timeout = max(.01, float(os.getenv("SIGNAL_FAST_AI_TIMEOUT_SECONDS", "15")))
+            ai_explanation = future.result(timeout=timeout)
+        except Exception:
+            ai_explanation, fallback_used = explanation, True
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        signal, plan = quick["signal"], quick["risk_plan"]
+        return {"main_signal_action": str(getattr(signal.get("side"), "value", signal.get("side"))),
+                "confidence": signal.get("confidence"), "risk_score": plan.get("risk_score"),
+                "live_price": quick.get("live_price"), "risk_plan": plan,
+                "ai_explanation": ai_explanation, "what_to_watch_next": watch,
+                "fallback_used": fallback_used, "ai_mode": "fast_explanation"}
+
     @app.post("/api/analyze/deep")
     def deep_analyze(request: DeepAnalyzeRequest):
         quick_context = {}
 
         def perform(progress):
             progress(1, "Preparing market data")
-            quick = quick_analyze(request)
+            quick = (quick_results.get(request.market.value, request.symbol)
+                     or quick_analyze(request))
             quick_context["result"] = quick
             progress(2, "Checking technical indicators")
             progress(3, "Running TradingAgents research")
-            deep = run_deep_analysis(request)
+            deep = run_deep_analysis(request, quick)
             if deep.get("ai_available") is False:
                 raise RuntimeError(deep.get("ai_notice") or "Deep AI is unavailable")
             progress(4, "Building plain-language summary")
@@ -407,8 +439,15 @@ def create_app() -> FastAPI:
                            "deep_analyzed_at": datetime.now(timezone.utc).isoformat()})
             return result
 
-        return deep_jobs.start(request.market.value, request.symbol, perform,
-                               lambda: quick_context.get("result") or quick_analyze(request),
+        def fallback():
+            quick = (quick_context.get("result") or
+                     quick_results.get(request.market.value, request.symbol) or quick_analyze(request))
+            explanation, watch = deterministic_fast_explanation(quick)
+            return {**quick, "fast_ai_explanation": {"main_signal_action": quick["signal"]["side"],
+                    "ai_explanation": explanation, "what_to_watch_next": watch,
+                    "fallback_used": True, "ai_mode": "fast_explanation"}}
+
+        return deep_jobs.start(request.market.value, request.symbol, perform, fallback,
                                refresh=request.refresh)
 
     @app.get("/api/analyze/deep/status/{job_id}")
