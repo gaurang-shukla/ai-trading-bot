@@ -14,8 +14,8 @@ The interface follows a staged workflow instead of placing everything on one scr
 2. Explore its searchable universe, breadth, top gainers, top losers and the clearly
    labelled Signal Fear & Greed calculation.
 3. Open AI Scores to rank the available assets by trend, mood, liquidity and risk.
-4. Open one asset for the full TradingAgents debate, deterministic risk decision and
-   optional Paperclip audit event.
+4. Open one asset for an immediate, deterministic Quick Signal. Start the slower
+   TradingAgents debate only with **Run Deep AI Research**.
 
 ```bash
 cd ~/Downloads/ai-trading-bot
@@ -32,12 +32,16 @@ set their URLs in the same file. Signal opens at `http://127.0.0.1:8787` and its
 system-check panel shows which layers still need setup. Chrome can install that page
 as a standalone app.
 
-The web app calls `/api/analyze`, which executes the real pipeline:
+The Analyse page separates the two pipelines:
 
-1. The selected OpenBB or WEEX adapter obtains a current market snapshot.
-2. `TradingAgentsGraph.propagate()` produces the research decision.
-3. The deterministic local risk engine approves or blocks a paper order intent.
-4. Paperclip receives the completed event when its task bridge is configured.
+1. `POST /api/analyze/quick` obtains a live OpenBB or WEEX snapshot and applies local
+   momentum, volatility, liquidity, funding and risk rules. It never loads
+   TradingAgents or calls an LLM.
+2. `POST /api/analyze/deep` runs `TradingAgentsGraph.propagate()` only after explicit
+   user action. Successful results are cached for 20 minutes by market and symbol;
+   send `refresh: true` to deliberately replace one.
+3. AI failures are displayed separately, leaving the Quick Signal and market data on
+   screen. Paperclip receives completed deep events when its task bridge is configured.
 
 Paperclip can also run the complete pipeline through its HTTP adapter. Point the
 adapter to `http://127.0.0.1:8787/api/paperclip/analyze` and give it the header
