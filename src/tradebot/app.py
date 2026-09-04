@@ -243,10 +243,12 @@ def create_app() -> FastAPI:
             histories, warnings = {}, []
             # Timeframes load concurrently under a tight provider timeout. A partial
             # response is useful and a total candle failure retains the old fast path.
-            with ThreadPoolExecutor(max_workers=len(TIMEFRAMES)) as executor:
+            timeframes = (("5m", "15m", "1h", "1d")
+                          if request.market is MarketKind.INDIAN_INDICES else TIMEFRAMES)
+            with ThreadPoolExecutor(max_workers=len(timeframes)) as executor:
                 futures = {executor.submit(candle_cache.get_or_load, f"{request.market.value}:{symbol}", frame,
                            lambda f=frame: provider.candles(symbol, f, 250)): frame
-                           for frame in TIMEFRAMES}
+                           for frame in timeframes}
                 for future in as_completed(futures):
                     frame = futures[future]
                     try:
