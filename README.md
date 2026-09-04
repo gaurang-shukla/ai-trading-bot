@@ -74,6 +74,7 @@ Current registry choices are:
 | Forex | OpenBB | Registry/data route available |
 | Commodities | OpenBB | Registry/data route available |
 | Options | OpenBB | Registry/data route available |
+| Indian indices | Yahoo Finance → OpenBB | BANK NIFTY, NIFTY 50 and related Indian bank stocks |
 
 Spot and futures remain separate adapters because WEEX exposes them through different
 domains and schemas. Additional venues can register implementations without modifying

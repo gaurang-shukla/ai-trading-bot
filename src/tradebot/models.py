@@ -19,6 +19,7 @@ class MarketKind(str, Enum):
     FOREX = "forex"
     COMMODITIES = "commodities"
     OPTIONS = "options"
+    INDIAN_INDICES = "indian_indices"
 
 
 @dataclass(frozen=True)

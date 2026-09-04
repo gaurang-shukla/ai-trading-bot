@@ -15,12 +15,20 @@ from .diagnostics import diagnostics
 
 
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
+INDIAN_RESEARCH_SYMBOLS = {
+    "BANKNIFTY": "^NSEBANK",
+    "NIFTY50": "^NSEI",
+    "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
+    "MIDCPNIFTY": "NIFTY_MID_SELECT.NS",
+}
 logger = logging.getLogger(__name__)
 
 
 def research_symbol(symbol: str) -> str:
     """Translate an exchange crypto pair into the format used by research feeds."""
     value = symbol.upper().replace("/", "").replace(":", "")
+    if value in INDIAN_RESEARCH_SYMBOLS:
+        return INDIAN_RESEARCH_SYMBOLS[value]
     if "-" in value:
         return value
     for quote in _CRYPTO_QUOTES:

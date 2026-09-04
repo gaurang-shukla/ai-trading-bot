@@ -19,6 +19,12 @@ SEED_UNIVERSES = {
     MarketKind.FOREX: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"],
     MarketKind.COMMODITIES: ["GC", "SI", "CL", "NG", "HG", "ZC", "ZW"],
     MarketKind.OPTIONS: ["AAPL", "NVDA", "SPY", "QQQ", "TSLA", "MSFT"],
+    MarketKind.INDIAN_INDICES: [
+        "BANKNIFTY", "NIFTY50", "FINNIFTY", "MIDCPNIFTY",
+        "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS",
+        "KOTAKBANK.NS", "INDUSINDBK.NS", "BANKBARODA.NS", "PNB.NS",
+        "AUBANK.NS", "IDFCFIRSTB.NS", "FEDERALBNK.NS",
+    ],
 }
 
 YAHOO_SYMBOLS = {
@@ -102,6 +108,11 @@ class MarketOverviewService:
     """Build consistent dashboards while preserving market-specific provider priority."""
 
     def _providers(self, market: MarketKind, symbol: str):
+        if market is MarketKind.INDIAN_INDICES:
+            from .adapters import research_symbol
+            provider_symbol = research_symbol(symbol)
+            return [(provider_symbol, YahooFinanceClient()),
+                    (provider_symbol, OpenBBClient(asset_class="index"))]
         yahoo_symbol = YAHOO_SYMBOLS.get(symbol, symbol)
         if market is MarketKind.OPTIONS:
             return [(symbol, OpenBBClient(asset_class="equity"))]
