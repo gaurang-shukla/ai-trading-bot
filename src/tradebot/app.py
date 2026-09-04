@@ -3,7 +3,7 @@ import os
 import secrets
 import json
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -54,6 +54,15 @@ def _provider_failure_category(*errors: Exception) -> str:
     if any(word in text for word in ("market closed", "stale")):
         return "market closed / stale data"
     return "provider unavailable"
+
+
+def _provider_error(public_message: str, exc: Exception) -> HTTPException:
+    """Return a stable user error without disclosing provider internals."""
+    diagnostics.failure("provider", exc)
+    detail = public_message
+    if _debug_enabled():
+        detail += f" ({type(exc).__name__}: {exc})"
+    return HTTPException(502, detail)
 
 
 class AnalyzeRequest(BaseModel):
@@ -204,6 +213,10 @@ def create_app() -> FastAPI:
                 item["status"] = "disabled" if name == "paperclip" else "not_configured"
         result["openai"].update(model=os.getenv("OPENAI_MODEL", "") or "gpt-4o-mini",
                                 api_key_loaded=bool(os.getenv("OPENAI_API_KEY")))
+        if not _debug_enabled():
+            for item in result.values():
+                item.pop("last_error", None)
+                item.pop("last_traceback", None)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/options/{symbol}")
@@ -212,7 +225,7 @@ def create_app() -> FastAPI:
             return OpenBBClient().option_chain(symbol, expiration)
         except Exception as exc:
             diagnostics.failure("openbb", exc)
-            raise HTTPException(502, f"Option chain could not load: {type(exc).__name__}: {exc}") from exc
+            raise _provider_error("Option chain is temporarily unavailable. Try again later.", exc) from exc
 
     @app.get("/api/banknifty-options")
     def banknifty_options(expiry: str | None = None, option_type: str | None = None,
@@ -260,7 +273,7 @@ def create_app() -> FastAPI:
         try:
             return market_overview(market)
         except Exception as exc:
-            raise HTTPException(502, f"Market overview could not load: {exc}") from exc
+            raise _provider_error("Market data is temporarily unavailable. Try again later.", exc) from exc
 
     def market_data(request: AnalyzeRequest):
         selection = MarketSelection(request.market, request.venue, request.symbol.upper())
@@ -293,7 +306,7 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(502, f"Analysis could not complete: {exc}") from exc
+            raise _provider_error("Deep AI could not complete. Quick Signal remains available.", exc) from exc
 
     @app.post("/api/analyze")
     def analyze(request: AnalyzeRequest):
@@ -311,16 +324,26 @@ def create_app() -> FastAPI:
             # response is useful and a total candle failure retains the old fast path.
             timeframes = (("5m", "15m", "1h", "1d")
                           if request.market is MarketKind.INDIAN_INDICES else TIMEFRAMES)
-            with ThreadPoolExecutor(max_workers=len(timeframes)) as executor:
-                futures = {executor.submit(candle_cache.get_or_load, f"{request.market.value}:{symbol}", frame,
-                           lambda f=frame: provider.candles(symbol, f, 250)): frame
-                           for frame in timeframes}
-                for future in as_completed(futures):
+            executor = ThreadPoolExecutor(max_workers=len(timeframes), thread_name_prefix="quick-candles")
+            futures = {executor.submit(candle_cache.get_or_load, f"{request.market.value}:{symbol}", frame,
+                       lambda f=frame: provider.candles(symbol, f, 250)): frame
+                       for frame in timeframes}
+            candle_timeout = max(.05, float(os.getenv("SIGNAL_QUICK_CANDLE_TIMEOUT_SECONDS", "8")))
+            try:
+                done, pending = wait(futures, timeout=candle_timeout)
+                for future in done:
                     frame = futures[future]
                     try:
                         histories[frame] = future.result()
                     except Exception as exc:
                         warnings.append(f"{frame} candles unavailable: {type(exc).__name__}")
+                for future in pending:
+                    future.cancel()
+                    warnings.append(f"{futures[future]} candles unavailable: timeout")
+            finally:
+                # A slow upstream must not hold the request open. Running urllib calls
+                # finish under their adapter timeout and cannot safely be killed.
+                executor.shutdown(wait=False, cancel_futures=True)
             result = quick_signals.analyze(snapshot, request.equity, histories)
             result.update(public_metadata(request.market, symbol))
             result.update({"live_price": snapshot.price, "change_24h": snapshot.change_24h,

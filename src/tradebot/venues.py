@@ -24,8 +24,10 @@ class VenueRegistry:
         return self._data[key]()
 
     def choices(self) -> list[dict[str, str]]:
+        """Return markets intended for navigation (generic options is unavailable)."""
         return [{"market": market.value, "venue": venue}
-                for market, venue in sorted(self._data, key=lambda x: (x[0].value, x[1]))]
+                for market, venue in sorted(self._data, key=lambda x: (x[0].value, x[1]))
+                if market is not MarketKind.OPTIONS]
 
 
 def default_registry() -> VenueRegistry:

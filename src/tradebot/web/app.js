@@ -25,8 +25,8 @@ function navigate(path){history.pushState({},'',path);render();}
 document.addEventListener('click',event=>{const link=event.target.closest('[data-link]');if(!link)return;event.preventDefault();navigate(link.getAttribute('href'));});
 window.addEventListener('popstate',render);
 
-async function getJSON(url, options){const response=await fetch(url,options);const data=await response.json();if(!response.ok)throw new Error(data.detail||'Unable to load data');return data;}
-async function getOverview(market){if(!cache.has(market))cache.set(market,getJSON(`/api/overview/${market}`));return cache.get(market);}
+async function getJSON(url, options){const response=await fetch(url,options);let data={};try{data=await response.json()}catch{}if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'Unable to load data. Please try again.');return data;}
+async function getOverview(market){if(!cache.has(market)){const request=getJSON(`/api/overview/${market}`).catch(error=>{cache.delete(market);throw error});cache.set(market,request)}return cache.get(market);}
 
 function pageHeader(eyebrow,title,copy,action=''){return `<div class="page-head"><div><p class="eyebrow">${eyebrow}</p><h1>${title}</h1><p>${copy}</p></div>${action}</div>`;}
 function errorView(error){app.innerHTML=`<div class="error-state"><h2>We couldn’t load this market</h2><p>${safe(error.message)}</p><a class="primary" href="/" data-link>Choose another market</a></div>`;}
@@ -102,8 +102,8 @@ function loadLightweightCharts(){
   if(window.LightweightCharts)return Promise.resolve(window.LightweightCharts);
   if(!lightweightChartsPromise)lightweightChartsPromise=new Promise((resolve,reject)=>{
     const script=document.createElement('script');script.src=LIGHTWEIGHT_CHARTS_URL;script.async=true;script.crossOrigin='anonymous';
-    script.onload=()=>window.LightweightCharts?resolve(window.LightweightCharts):reject(new Error('Lightweight Charts did not initialize'));
-    script.onerror=()=>reject(new Error('Lightweight Charts failed to load'));document.head.appendChild(script);
+    script.onload=()=>window.LightweightCharts?resolve(window.LightweightCharts):(lightweightChartsPromise=null,reject(new Error('Lightweight Charts did not initialize')));
+    script.onerror=()=>{lightweightChartsPromise=null;reject(new Error('Lightweight Charts failed to load'))};document.head.appendChild(script);
   });
   return lightweightChartsPromise;
 }
