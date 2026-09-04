@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
 from .analysis import CandleCache, DeepAnalysisCache, QuickSignalEngine, TIMEFRAMES
+from .banknifty_options import UNAVAILABLE_MESSAGE, build_chain
 from .diagnostics import diagnostics
 from .config import load_project_env
 from .execution import PaperBroker
@@ -196,6 +197,26 @@ def create_app() -> FastAPI:
             diagnostics.failure("openbb", exc)
             raise HTTPException(502, f"Option chain could not load: {type(exc).__name__}: {exc}") from exc
 
+    @app.get("/api/banknifty-options")
+    def banknifty_options(expiry: str | None = None, option_type: str | None = None,
+                          moneyness: str | None = None):
+        """Return a genuine OpenBB chain or an explicit, non-error unavailable state."""
+        try:
+            provider = OpenBBClient(asset_class="index")
+            raw = provider.option_chain("BANKNIFTY", expiry)
+            if not raw.get("contracts"):
+                raise ValueError("OpenBB returned no BANKNIFTY option contracts")
+            spot = provider.snapshot("^NSEBANK").price
+            result = build_chain(raw, spot, expiry, option_type, moneyness)
+            # Filters may legitimately select no contracts while the provider remains available.
+            result["available"] = True
+            return result
+        except Exception as exc:
+            diagnostics.failure("openbb", exc)
+            return {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
+                    "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
+                    "research_only": True}
+
     @app.get("/api/markets")
     def markets():
         return default_registry().choices()
@@ -213,8 +234,18 @@ def create_app() -> FastAPI:
 
     def run_deep_analysis(request: AnalyzeRequest):
         try:
+            provider = market_data(request)
+            if request.market is MarketKind.INDIAN_INDICES or request.symbol.upper().endswith(".NS"):
+                try:
+                    bars = provider.candles(request.symbol.upper(), "1d", 60)
+                    if len(bars) < 20:
+                        raise ValueError("incomplete OHLCV history")
+                except Exception:
+                    return {"ai_available": False, "ai_notice":
+                            "Deep AI unavailable for this Indian asset because provider OHLCV data is incomplete. Quick Signal remains available.",
+                            "research_only": True}
             service = TradingService(
-                market_data(request),
+                provider,
                 signals,
                 RiskEngine(RiskLimits()),
                 PaperBroker(request.equity),

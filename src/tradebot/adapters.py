@@ -388,7 +388,11 @@ def _normalize_option(row: dict) -> dict:
             "iv": _optional_float(first("implied_volatility", "iv")),
             "delta": _optional_float(first("delta")), "gamma": _optional_float(first("gamma")),
             "theta": _optional_float(first("theta")), "vega": _optional_float(first("vega")),
-            "last_price": _optional_float(first("last_price", "last"))}
+            "last_price": _optional_float(first("last_price", "last", "close")),
+            "change": _optional_float(first("change", "change_percent", "percent_change")),
+            "volume": _optional_float(first("volume", "contract_volume")),
+            "bid": _optional_float(first("bid", "bid_price")),
+            "ask": _optional_float(first("ask", "ask_price"))}
 
 
 def _max_pain(rows: list[dict]) -> float | None:

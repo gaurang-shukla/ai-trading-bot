@@ -1,0 +1,348 @@
+From f74ea83dd0bdb1b7bdb618a9c86d53096af251e6 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 4 Sep 2026 20:10:31 +0000
+Subject: [PATCH] Add Bank Nifty options research support
+
+---
+ src/tradebot/adapters.py          |  6 ++-
+ src/tradebot/app.py               | 33 +++++++++++-
+ src/tradebot/banknifty_options.py | 86 +++++++++++++++++++++++++++++++
+ src/tradebot/models.py            | 24 +++++++++
+ src/tradebot/venues.py            |  1 +
+ src/tradebot/web/app.js           | 15 +++++-
+ src/tradebot/web/styles.css       |  1 +
+ tests/test_banknifty_options.py   | 65 +++++++++++++++++++++++
+ 8 files changed, 227 insertions(+), 4 deletions(-)
+ create mode 100644 src/tradebot/banknifty_options.py
+ create mode 100644 tests/test_banknifty_options.py
+
+diff --git a/src/tradebot/adapters.py b/src/tradebot/adapters.py
+index d9f0e28..22c0835 100644
+--- a/src/tradebot/adapters.py
++++ b/src/tradebot/adapters.py
+@@ -388,7 +388,11 @@ def _normalize_option(row: dict) -> dict:
+             "iv": _optional_float(first("implied_volatility", "iv")),
+             "delta": _optional_float(first("delta")), "gamma": _optional_float(first("gamma")),
+             "theta": _optional_float(first("theta")), "vega": _optional_float(first("vega")),
+-            "last_price": _optional_float(first("last_price", "last"))}
++            "last_price": _optional_float(first("last_price", "last", "close")),
++            "change": _optional_float(first("change", "change_percent", "percent_change")),
++            "volume": _optional_float(first("volume", "contract_volume")),
++            "bid": _optional_float(first("bid", "bid_price")),
++            "ask": _optional_float(first("ask", "ask_price"))}
+ 
+ 
+ def _max_pain(rows: list[dict]) -> float | None:
+diff --git a/src/tradebot/app.py b/src/tradebot/app.py
+index 7751b51..11b6541 100644
+--- a/src/tradebot/app.py
++++ b/src/tradebot/app.py
+@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
+ 
+ from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
+ from .analysis import CandleCache, DeepAnalysisCache, QuickSignalEngine, TIMEFRAMES
++from .banknifty_options import UNAVAILABLE_MESSAGE, build_chain
+ from .diagnostics import diagnostics
+ from .config import load_project_env
+ from .execution import PaperBroker
+@@ -196,6 +197,26 @@ def create_app() -> FastAPI:
+             diagnostics.failure("openbb", exc)
+             raise HTTPException(502, f"Option chain could not load: {type(exc).__name__}: {exc}") from exc
+ 
++    @app.get("/api/banknifty-options")
++    def banknifty_options(expiry: str | None = None, option_type: str | None = None,
++                          moneyness: str | None = None):
++        """Return a genuine OpenBB chain or an explicit, non-error unavailable state."""
++        try:
++            provider = OpenBBClient(asset_class="index")
++            raw = provider.option_chain("BANKNIFTY", expiry)
++            if not raw.get("contracts"):
++                raise ValueError("OpenBB returned no BANKNIFTY option contracts")
++            spot = provider.snapshot("^NSEBANK").price
++            result = build_chain(raw, spot, expiry, option_type, moneyness)
++            # Filters may legitimately select no contracts while the provider remains available.
++            result["available"] = True
++            return result
++        except Exception as exc:
++            diagnostics.failure("openbb", exc)
++            return {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
++                    "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
++                    "research_only": True}
++
+     @app.get("/api/markets")
+     def markets():
+         return default_registry().choices()
+@@ -213,8 +234,18 @@ def create_app() -> FastAPI:
+ 
+     def run_deep_analysis(request: AnalyzeRequest):
+         try:
++            provider = market_data(request)
++            if request.market is MarketKind.INDIAN_INDICES or request.symbol.upper().endswith(".NS"):
++                try:
++                    bars = provider.candles(request.symbol.upper(), "1d", 60)
++                    if len(bars) < 20:
++                        raise ValueError("incomplete OHLCV history")
++                except Exception:
++                    return {"ai_available": False, "ai_notice":
++                            "Deep AI unavailable for this Indian asset because provider OHLCV data is incomplete. Quick Signal remains available.",
++                            "research_only": True}
+             service = TradingService(
+-                market_data(request),
++                provider,
+                 signals,
+                 RiskEngine(RiskLimits()),
+                 PaperBroker(request.equity),
+diff --git a/src/tradebot/banknifty_options.py b/src/tradebot/banknifty_options.py
+new file mode 100644
+index 0000000..fefd326
+--- /dev/null
++++ b/src/tradebot/banknifty_options.py
+@@ -0,0 +1,86 @@
++"""Real-data-only Bank Nifty option-chain normalization and scoring."""
++
++from dataclasses import asdict
++
++from .models import OptionContract
++
++UNAVAILABLE_MESSAGE = "Bank Nifty options data provider not configured yet."
++
++
++def atm_strike(strikes: list[float], spot: float) -> float | None:
++    """Return the listed strike nearest spot; lower strike wins an exact tie."""
++    return min(strikes, key=lambda strike: (abs(strike - spot), strike)) if strikes else None
++
++
++def moneyness(option_type: str, strike: float, spot: float, atm: float) -> str:
++    if strike == atm:
++        return "ATM"
++    if option_type == "CE":
++        return "ITM" if strike < spot else "OTM"
++    return "ITM" if strike > spot else "OTM"
++
++
++def option_score(contract: OptionContract) -> dict:
++    """Score only observable contract properties with deterministic rules."""
++    liquid = (contract.volume or 0) > 0 and (contract.open_interest or 0) > 0
++    spread_pct = ((contract.ask - contract.bid) / contract.last_price * 100
++                  if contract.ask is not None and contract.bid is not None
++                  and contract.last_price else None)
++    risk = 35 + (25 if not liquid else 0) + (20 if spread_pct is not None and spread_pct > 5 else 0)
++    risk = min(100, risk + (10 if contract.moneyness == "OTM" else 0))
++    momentum = contract.change or 0
++    if not liquid or risk >= 75:
++        signal, confidence, reason = "AVOID", .82, "Insufficient liquidity or an excessive quoted spread."
++    elif contract.moneyness == "ATM" and momentum > 0:
++        signal, confidence = f"BUY {contract.option_type}", min(.9, .62 + min(momentum, 10) / 50)
++        reason = "ATM contract has positive price momentum and observable liquidity."
++    else:
++        signal, confidence, reason = "WATCH", .58, "No strong, liquid ATM momentum setup is present."
++    price = contract.last_price
++    return {"signal": signal, "confidence": round(confidence, 2), "risk_score": risk,
++            "reason": reason,
++            "suggested_stop_loss": round(price * .8, 2) if price is not None else None,
++            "suggested_target": round(price * 1.3, 2) if price is not None else None}
++
++
++def build_chain(raw: dict, spot: float, expiry: str | None = None,
++                option_type: str | None = None, money: str | None = None) -> dict:
++    rows = raw.get("contracts") or []
++    strikes = sorted({float(row["strike"]) for row in rows if row.get("strike") is not None})
++    atm = atm_strike(strikes, spot)
++    contracts = []
++    for row in rows:
++        strike = _float(row.get("strike"))
++        kind = str(row.get("option_type") or "").upper()
++        kind = {"CALL": "CE", "PUT": "PE", "C": "CE", "P": "PE"}.get(kind, kind)
++        contract_expiry = str(row.get("expiry") or row.get("expiration") or "")
++        if strike is None or kind not in {"CE", "PE"} or not contract_expiry:
++            continue
++        classification = moneyness(kind, strike, spot, atm)
++        if expiry and contract_expiry != expiry:
++            continue
++        if option_type and kind != option_type.upper():
++            continue
++        if money and classification != money.upper():
++            continue
++        contract = OptionContract(
++            contract_expiry, strike, kind, _float(row.get("last_price")),
++            _float(row.get("change")), _float(row.get("volume")),
++            _float(row.get("open_interest")),
++            _float(row.get("implied_volatility") if row.get("implied_volatility") is not None else row.get("iv")),
++            _float(row.get("delta")), _float(row.get("gamma")), _float(row.get("theta")),
++            _float(row.get("vega")), _float(row.get("bid")), _float(row.get("ask")), spot,
++            classification, round((strike - spot) / spot * 100, 4))
++        contracts.append({**asdict(contract), "score": option_score(contract)})
++    expiries = sorted({str(row.get("expiry") or row.get("expiration")) for row in rows
++                       if row.get("expiry") or row.get("expiration")})
++    return {"available": bool(contracts), "symbol": "BANKNIFTY", "underlying_symbol": "^NSEBANK",
++            "underlying_price": spot, "atm_strike": atm, "expiries": expiries,
++            "contracts": contracts, "source": "OpenBB", "research_only": True}
++
++
++def _float(value) -> float | None:
++    try:
++        return float(value) if value is not None else None
++    except (TypeError, ValueError):
++        return None
+diff --git a/src/tradebot/models.py b/src/tradebot/models.py
+index 892a815..36c5103 100644
+--- a/src/tradebot/models.py
++++ b/src/tradebot/models.py
+@@ -20,6 +20,30 @@ class MarketKind(str, Enum):
+     COMMODITIES = "commodities"
+     OPTIONS = "options"
+     INDIAN_INDICES = "indian_indices"
++    BANKNIFTY_OPTIONS = "banknifty_options"
++
++
++@dataclass(frozen=True)
++class OptionContract:
++    """Provider-neutral, research-only representation of an option contract."""
++
++    expiry: str
++    strike: float
++    option_type: str
++    last_price: float | None
++    change: float | None
++    volume: float | None
++    open_interest: float | None
++    implied_volatility: float | None
++    delta: float | None
++    gamma: float | None
++    theta: float | None
++    vega: float | None
++    bid: float | None
++    ask: float | None
++    underlying_price: float
++    moneyness: str
++    distance_from_spot_pct: float
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/src/tradebot/venues.py b/src/tradebot/venues.py
+index b33d9c2..2731ca5 100644
+--- a/src/tradebot/venues.py
++++ b/src/tradebot/venues.py
+@@ -41,6 +41,7 @@ def default_registry() -> VenueRegistry:
+         registry.register(market, "openbb", lambda kind=asset_class: FallbackMarketData(
+             OpenBBClient(asset_class=kind), YahooFinanceClient()))
+     registry.register(MarketKind.OPTIONS, "openbb", lambda: OpenBBClient(asset_class="equity"))
++    registry.register(MarketKind.BANKNIFTY_OPTIONS, "openbb", lambda: OpenBBClient(asset_class="index"))
+     # Yahoo is primary and OpenBB is the only fallback; WEEX is crypto-only.
+     registry.register(MarketKind.INDIAN_INDICES, "openbb", lambda: FallbackMarketData(
+         NormalizedMarketData(YahooFinanceClient()),
+diff --git a/src/tradebot/web/app.js b/src/tradebot/web/app.js
+index 373b9f2..615c6fd 100644
+--- a/src/tradebot/web/app.js
++++ b/src/tradebot/web/app.js
+@@ -7,7 +7,8 @@ const markets = [
+   {id:'forex',name:'Forex',icon:'↔',desc:'Major global currency pairs'},
+   {id:'commodities',name:'Commodities',icon:'◈',desc:'Metals, energy and agricultural markets'},
+   {id:'options',name:'Options',icon:'⌁',desc:'Options research by underlying company'},
+-  {id:'indian_indices',name:'Indian Indices',icon:'₹',desc:'NIFTY, BANK NIFTY and Indian market indices'}
++  {id:'indian_indices',name:'Indian Indices',icon:'₹',desc:'NIFTY, BANK NIFTY and Indian market indices'},
++  {id:'banknifty_options',name:'Bank Nifty Options',icon:'₹',desc:'CE/PE strikes, expiry, OI and option signals'}
+ ];
+ const displayNames = {BANKNIFTY:'BANK NIFTY',NIFTY50:'NIFTY 50',FINNIFTY:'FINNIFTY',MIDCPNIFTY:'MIDCPNIFTY'};
+ const displaySymbol = symbol => displayNames[symbol] || symbol;
+@@ -69,6 +70,16 @@ async function runDeep(market,symbol,refresh){const button=document.getElementBy
+ 
+ async function loadOptions(symbol){const target=document.getElementById('options-chain');try{const d=await getJSON(`/api/options/${encodeURIComponent(symbol)}`);const fields=[['Put/Call Ratio',d.put_call_ratio],['Max Pain',d.max_pain]].filter(x=>x[1]!=null);const columns=[['option_type','Type'],['strike','Strike'],['open_interest','Open Interest'],['iv','IV'],['delta','Delta'],['gamma','Gamma'],['theta','Theta'],['vega','Vega']].filter(([key])=>d.contracts.some(r=>r[key]!=null&&r[key]!==''));target.innerHTML=`<p class="eyebrow">OPENBB OPTION CHAIN</p><div>${fields.map(x=>`<b>${x[0]}:</b> ${number(x[1])} `).join('')}</div>${d.expiries.length?`<label>Expiry <select id="expiry">${d.expiries.map(x=>`<option>${safe(x)}</option>`).join('')}</select></label>`:''}${d.strikes.length?`<label>Strike <select>${d.strikes.map(x=>`<option>${number(x)}</option>`).join('')}</select></label>`:''}<div class="table-wrap"><table class="market-table"><thead><tr>${columns.map(x=>`<th>${x[1]}</th>`).join('')}</tr></thead><tbody>${d.contracts.map(r=>`<tr>${columns.map(([key])=>`<td>${key==='option_type'?safe(r[key]):number(r[key])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`}catch(e){target.remove()}}
+ 
+-function render(){const parts=location.pathname.split('/').filter(Boolean);if(!parts.length)return home();if(parts[0]==='market'&&parts[1])return marketPage(parts[1]);if(parts[0]==='scores'&&parts[1])return scoresPage(parts[1]);if(parts[0]==='asset'&&parts[1]&&parts[2])return assetPage(parts[1],decodeURIComponent(parts.slice(2).join('/')));return home();}
++function bankOptionRows(rows){return rows.map(r=>`<tr><td><b>${safe(r.option_type)}</b></td><td>${number(r.strike)}</td><td>${safe(r.moneyness)}</td><td>${number(r.last_price)}</td><td class="${r.change>=0?'positive':'negative'}">${pct(r.change)}</td><td>${number(r.volume)}</td><td>${number(r.open_interest)}</td><td>${number(r.implied_volatility)}</td><td>${number(r.bid)} / ${number(r.ask)}</td><td><b>${safe(r.score.signal)}</b><br><small>${Math.round(r.score.confidence*100)}% · risk ${r.score.risk_score}</small></td></tr>`).join('')}
++
++async function bankNiftyOptionsPage(){
++  app.innerHTML='<div class="loading-page"><div class="spinner"></div><p>Loading the real Bank Nifty option chain…</p></div>';
++  try{const data=await getJSON('/api/banknifty-options');if(!data.available){app.innerHTML=`<a class="back" href="/" data-link>← All markets</a>${pageHeader('RESEARCH ONLY','Bank Nifty Options','CE/PE strikes, expiry, OI and option signals')}<div class="empty-state panel"><h2>${safe(data.message)}</h2><p>No option rows are generated when a real chain is unavailable. No live options order placement.</p></div>`;return}
++    app.innerHTML=`<a class="back" href="/" data-link>← All markets</a>${pageHeader('RESEARCH ONLY','Bank Nifty Options','CE/PE strikes, expiry, OI and option signals')}<section class="option-reference panel"><div><small>BANK NIFTY live reference price</small><strong>${number(data.underlying_price)}</strong></div><div><small>ATM strike</small><strong>${number(data.atm_strike)}</strong></div><label>Expiry <select id="option-expiry"><option value="">All</option>${data.expiries.map(x=>`<option value="${safe(x)}">${safe(x)}</option>`).join('')}</select></label></section><div class="option-filters" id="option-filters">${['ALL','CE','PE','ITM','ATM','OTM'].map(x=>`<button class="ghost${x==='ALL'?' active':''}" data-filter="${x}">${x}</button>`).join('')}</div><div class="table-wrap"><table class="market-table"><thead><tr><th>Type</th><th>Strike</th><th>Moneyness</th><th>Last</th><th>Change</th><th>Volume</th><th>Open interest</th><th>IV</th><th>Bid / Ask</th><th>Option signal</th></tr></thead><tbody id="bank-option-body">${bankOptionRows(data.contracts)}</tbody></table></div><p class="source-note">Source: OpenBB · Research only · No live options order placement.</p>`;
++    let filter='ALL';const draw=()=>{const expiry=document.getElementById('option-expiry').value;document.getElementById('bank-option-body').innerHTML=bankOptionRows(data.contracts.filter(r=>(!expiry||r.expiry===expiry)&&(filter==='ALL'||r.option_type===filter||r.moneyness===filter)))};document.getElementById('option-expiry').addEventListener('change',draw);document.getElementById('option-filters').addEventListener('click',e=>{if(!e.target.dataset.filter)return;filter=e.target.dataset.filter;document.querySelectorAll('#option-filters button').forEach(b=>b.classList.toggle('active',b.dataset.filter===filter));draw()})
++  }catch(error){errorView(error)}
++}
++
++function render(){const parts=location.pathname.split('/').filter(Boolean);if(!parts.length)return home();if(parts[0]==='market'&&parts[1]==='banknifty_options')return bankNiftyOptionsPage();if(parts[0]==='market'&&parts[1])return marketPage(parts[1]);if(parts[0]==='scores'&&parts[1])return scoresPage(parts[1]);if(parts[0]==='asset'&&parts[1]&&parts[2])return assetPage(parts[1],decodeURIComponent(parts.slice(2).join('/')));return home();}
+ 
+ let installPrompt;window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e});document.getElementById('install').addEventListener('click',async()=>{if(installPrompt){installPrompt.prompt();await installPrompt.userChoice;installPrompt=null}else alert('In Chrome, open the menu and choose “Cast, save and share” → “Install page as app”.')});if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js');render();
+diff --git a/src/tradebot/web/styles.css b/src/tradebot/web/styles.css
+index a102598..f59c706 100644
+--- a/src/tradebot/web/styles.css
++++ b/src/tradebot/web/styles.css
+@@ -1,3 +1,4 @@
+ :root{color-scheme:dark;--bg:#050b12;--panel:#0b1621;--panel2:#101e2c;--line:#203549;--line2:#2d4a61;--text:#eff7ff;--muted:#91a7ba;--mint:#65e1bd;--green:#2ed49b;--red:#ff667a;--amber:#ffc45b;--blue:#63b4ff;font:16px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;min-height:100vh;background:radial-gradient(circle at 80% -10%,#12344b 0,transparent 28rem),var(--bg);color:var(--text)}button,input{font:inherit}button,a{cursor:pointer}:focus-visible{outline:3px solid var(--blue);outline-offset:3px}.topbar{height:72px;padding:0 max(20px,calc((100vw - 1280px)/2));display:flex;align-items:center;gap:34px;border-bottom:1px solid var(--line);background:rgba(5,11,18,.9);backdrop-filter:blur(16px);position:sticky;top:0;z-index:20}.brand{display:flex;align-items:center;gap:10px;color:var(--text);text-decoration:none;font-weight:900;font-size:1.12rem}.logo{display:grid;place-items:center;width:37px;height:37px;border-radius:11px;background:var(--mint);color:#03251b}.topbar nav{display:flex;gap:24px;flex:1}.topbar nav a{color:var(--muted);text-decoration:none;font-weight:700;font-size:.9rem}.topbar nav a:hover{color:var(--text)}.header-actions{display:flex;align-items:center;gap:12px}.mode{font-size:.83rem;color:var(--muted)}.mode i{display:inline-block;width:8px;height:8px;background:var(--green);border-radius:50%;margin-right:6px}.ghost{color:var(--text);border:1px solid var(--line2);background:var(--panel);border-radius:10px;padding:8px 13px}#app{width:min(1280px,calc(100% - 40px));margin:auto;padding:40px 0 80px;min-height:calc(100vh - 130px)}footer{border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:20px;color:#71879a;font-size:.78rem;padding:20px max(20px,calc((100vw - 1280px)/2))}.eyebrow{font-size:.76rem;letter-spacing:.14em;color:var(--mint);font-weight:900;text-transform:uppercase;margin:0 0 8px}.page-head{display:flex;justify-content:space-between;align-items:end;gap:28px;margin-bottom:28px}.page-head h1{font-size:clamp(2.2rem,5vw,4.2rem);line-height:1;letter-spacing:-.055em;margin:0}.page-head p:last-child{color:var(--muted);max-width:610px;margin:12px 0 0}.back{color:var(--muted);text-decoration:none;font-weight:750;display:inline-block;margin-bottom:22px}.primary{display:inline-flex;justify-content:center;align-items:center;min-height:48px;padding:0 20px;border:0;border-radius:12px;background:var(--mint);color:#03251b;text-decoration:none;font-weight:900;white-space:nowrap}.market-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:15px}.market-card{min-height:210px;padding:22px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(145deg,#102231,#09141e);color:var(--text);text-decoration:none;position:relative;overflow:hidden;transition:.2s transform,.2s border-color}.market-card:hover{transform:translateY(-3px);border-color:var(--mint)}.market-icon{font-size:1.65rem;display:grid;place-items:center;width:48px;height:48px;border-radius:14px;background:#152b3c}.market-card h2{font-size:1.25rem;margin:30px 0 5px}.market-card p{margin:0;color:var(--muted);font-size:.9rem}.market-card .arrow{position:absolute;right:20px;top:20px;color:var(--mint);font-size:1.3rem}.layer-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:24px}.layer{border:1px solid var(--line);background:#08131d;border-radius:13px;padding:13px}.layer b,.layer small{display:block}.layer small{font-size:.74rem;color:var(--muted)}.layer .ready{color:var(--green)}.layer .needs{color:var(--amber)}.summary-grid{display:grid;grid-template-columns:1fr 1.25fr 1.5fr;gap:14px}.panel{border:1px solid var(--line);background:linear-gradient(145deg,#0d1d2a,#08131d);border-radius:18px;padding:20px}.panel h2{font-size:1rem;margin:0 0 18px}.gauge{width:170px;height:88px;margin:18px auto 10px;overflow:hidden;position:relative}.gauge:before{content:"";position:absolute;width:150px;height:150px;left:10px;top:8px;border:18px solid transparent;border-top-color:var(--red);border-right-color:var(--amber);border-bottom-color:var(--green);border-left-color:var(--red);border-radius:50%;transform:rotate(-45deg)}.gauge-score{text-align:center;font-size:2rem;font-weight:900}.gauge-label{text-align:center;color:var(--muted)}.mover-list{display:grid;gap:10px}.mover{display:grid;grid-template-columns:1fr auto auto;gap:12px;font-size:.88rem}.positive{color:var(--green)}.negative{color:var(--red)}.breadth{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.metric span{display:block;color:var(--muted);font-size:.78rem}.metric strong{font-size:1.35rem}.spark{height:70px;margin-top:20px;background:linear-gradient(180deg,transparent 48%,#183044 49%,transparent 51%),linear-gradient(135deg,transparent 0 20%,#1bc893 21% 22%,transparent 23% 34%,#1bc893 35% 36%,transparent 37% 50%,#1bc893 51% 52%,transparent 53%);opacity:.75}.toolbar{display:flex;gap:12px;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding:27px 0 15px;margin-bottom:4px}.tabs{display:flex;gap:20px}.tabs a{color:var(--muted);text-decoration:none;font-weight:800}.tabs a.active{color:var(--text)}.search{width:min(340px,100%);height:44px;border:1px solid var(--line2);background:var(--panel);border-radius:12px;color:var(--text);padding:0 14px}.table-wrap{overflow:auto}.market-table{width:100%;border-collapse:collapse;min-width:760px}.market-table th{text-align:left;color:var(--muted);font-size:.76rem;font-weight:650;padding:14px 10px}.market-table td{padding:14px 10px;border-top:1px solid #142637}.market-table tr:hover td{background:#0a1721}.market-table a{color:var(--text);font-weight:800;text-decoration:none}.score{display:inline-grid;place-items:center;min-width:48px;height:32px;border:1px solid var(--line2);border-radius:9px;font-weight:900}.score.high{color:var(--green);border-color:#246a55}.score.mid{color:var(--amber);border-color:#735b2b}.score.low{color:var(--red);border-color:#713342}.source-note{font-size:.78rem;color:#6f8598;margin-top:12px}.empty-state,.error-state,.loading-page{text-align:center;padding:80px 20px;color:var(--muted)}.spinner{width:32px;height:32px;border:3px solid var(--line);border-top-color:var(--mint);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto}@keyframes spin{to{transform:rotate(360deg)}}.score-hero{display:grid;grid-template-columns:1.4fr .6fr;gap:14px}.score-explain{font-size:1.05rem;color:#c6d5e2}.formula{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:18px}.formula div{background:#07131d;border:1px solid var(--line);border-radius:11px;padding:11px}.formula b,.formula small{display:block}.formula small{color:var(--muted)}.detail-grid{display:grid;grid-template-columns:.8fr 1.2fr;gap:15px}.decision{font-size:3rem;font-weight:950;letter-spacing:-.04em;margin:5px 0}.confidence-bar{height:10px;background:#07131d;border-radius:99px;overflow:hidden}.confidence-bar span{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--mint))}.plain-copy{white-space:pre-wrap;color:#c6d5e2}.warning{padding:14px;border:1px solid #624d25;background:#2a2011;color:#ffda94;border-radius:12px}.hidden{display:none!important}@media(max-width:900px){.market-grid{grid-template-columns:repeat(2,1fr)}.summary-grid,.score-hero,.detail-grid{grid-template-columns:1fr}.layer-strip{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.topbar{height:64px;padding:0 14px;gap:15px}.topbar nav{display:none}.mode{display:none}#app{width:min(100% - 28px,1280px);padding:28px 0 60px}.page-head{align-items:flex-start;flex-direction:column}.page-head h1{font-size:2.5rem}.market-grid{grid-template-columns:1fr}.market-card{min-height:165px}.market-card h2{margin-top:20px}.summary-grid,.breadth,.formula{grid-template-columns:1fr}.toolbar{align-items:stretch;flex-direction:column}.tabs{overflow:auto}.search{width:100%}footer{flex-direction:column}}
+ .deep-area{margin-top:18px}.deep-area>div:first-child{display:inline-block;margin-right:24px}.deep-area .primary:disabled{opacity:.55;cursor:wait}.research-running{display:flex;align-items:center;gap:12px;margin-top:20px;color:var(--muted)}.research-running .spinner{margin:0;width:24px;height:24px}.deep-meta{margin-top:20px;color:var(--muted);display:flex;align-items:center;gap:12px;flex-wrap:wrap}.ai-error{padding:14px;border:1px solid #713342;background:#2b1118;color:#ff9cab;border-radius:12px;margin-top:18px}#deep-result{margin-top:18px}
+ .technical-grid{display:grid;grid-template-columns:1.6fr .7fr;gap:15px;margin-top:15px}.technical-table{min-width:650px}.level-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.level-grid div{padding:14px;background:#07131d;border:1px solid var(--line);border-radius:11px}.level-grid small,.level-grid strong{display:block}.level-grid small{color:var(--muted)}.level-grid strong{margin-top:5px}.why-panel{margin-top:15px}.why-panel>p:not(.eyebrow){color:#c6d5e2}@media(max-width:900px){.technical-grid{grid-template-columns:1fr}}
++.option-reference{display:flex;align-items:end;gap:35px;margin-bottom:16px}.option-reference div{display:grid}.option-reference strong{font-size:1.7rem}.option-reference small{color:var(--muted)}.option-reference select{display:block;background:var(--panel2);color:var(--text);border:1px solid var(--line2);border-radius:8px;padding:8px}.option-filters{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}.option-filters .active{color:#03251b;background:var(--mint);border-color:var(--mint)}
+diff --git a/tests/test_banknifty_options.py b/tests/test_banknifty_options.py
+new file mode 100644
+index 0000000..e34d303
+--- /dev/null
++++ b/tests/test_banknifty_options.py
+@@ -0,0 +1,65 @@
++from unittest.mock import Mock, patch
++
++from fastapi.testclient import TestClient
++
++from tradebot.app import app
++from tradebot.banknifty_options import atm_strike, build_chain
++from tradebot.models import MarketKind, MarketSnapshot
++
++client = TestClient(app)
++
++RAW = {"contracts": [
++    {"expiration": "2026-09-10", "strike": 51000, "option_type": "call", "last_price": 200,
++     "change": 3, "volume": 100, "open_interest": 1000, "iv": 18, "bid": 199, "ask": 201},
++    {"expiration": "2026-09-10", "strike": 51000, "option_type": "put", "last_price": 180,
++     "change": -2, "volume": 80, "open_interest": 900},
++    {"expiration": "2026-09-10", "strike": 51500, "option_type": "call", "last_price": 90,
++     "volume": 40, "open_interest": 500},
++]}
++
++
++def test_banknifty_options_route_exists():
++    assert client.get("/market/banknifty_options").status_code == 200
++    assert {"market": "banknifty_options", "venue": "openbb"} in client.get("/api/markets").json()
++
++
++def test_unavailable_provider_state_does_not_crash_or_return_fake_rows():
++    with patch("tradebot.app.OpenBBClient.option_chain", side_effect=RuntimeError("not supported")):
++        response = client.get("/api/banknifty-options")
++    assert response.status_code == 200
++    assert response.json()["message"] == "Bank Nifty options data provider not configured yet."
++    assert response.json()["contracts"] == []
++    assert response.json()["available"] is False
++
++
++def test_ce_pe_and_moneyness_filtering():
++    calls = build_chain(RAW, 51020, option_type="CE")
++    puts = build_chain(RAW, 51020, option_type="PE")
++    assert calls["contracts"] and all(row["option_type"] == "CE" for row in calls["contracts"])
++    assert puts["contracts"] and all(row["option_type"] == "PE" for row in puts["contracts"])
++    assert all(row["moneyness"] == "ATM" for row in build_chain(RAW, 51020, money="ATM")["contracts"])
++
++
++def test_atm_strike_calculation_and_score_schema():
++    assert atm_strike([50500, 51000, 51500], 51250) == 51000
++    result = build_chain(RAW, 51020)
++    score = result["contracts"][0]["score"]
++    assert set(score) == {"signal", "confidence", "risk_score", "reason",
++                          "suggested_stop_loss", "suggested_target"}
++    assert score["signal"] in {"BUY CE", "BUY PE", "WATCH", "AVOID"}
++    assert result["underlying_symbol"] == "^NSEBANK"
++
++
++def test_indian_deep_ai_missing_ohlcv_has_clean_fallback():
++    provider = Mock()
++    provider.candles.return_value = []
++    registry = Mock()
++    registry.market_data.return_value = provider
++    with patch("tradebot.app.default_registry", return_value=registry):
++        response = client.post("/api/analyze/deep", json={"market": MarketKind.EQUITIES.value,
++            "venue": "openbb", "symbol": "RELIANCE.NS", "equity": 100000, "refresh": True})
++    assert response.status_code == 200
++    assert response.json()["ai_available"] is False
++    assert response.json()["ai_notice"] == (
++        "Deep AI unavailable for this Indian asset because provider OHLCV data is incomplete. "
++        "Quick Signal remains available.")
+-- 
+2.43.0
+

@@ -20,6 +20,30 @@ class MarketKind(str, Enum):
     COMMODITIES = "commodities"
     OPTIONS = "options"
     INDIAN_INDICES = "indian_indices"
+    BANKNIFTY_OPTIONS = "banknifty_options"
+
+
+@dataclass(frozen=True)
+class OptionContract:
+    """Provider-neutral, research-only representation of an option contract."""
+
+    expiry: str
+    strike: float
+    option_type: str
+    last_price: float | None
+    change: float | None
+    volume: float | None
+    open_interest: float | None
+    implied_volatility: float | None
+    delta: float | None
+    gamma: float | None
+    theta: float | None
+    vega: float | None
+    bid: float | None
+    ask: float | None
+    underlying_price: float
+    moneyness: str
+    distance_from_spot_pct: float
 
 
 @dataclass(frozen=True)
