@@ -73,7 +73,7 @@ function placeChartLabels(labels,top,bottom,spacing=18){
   }
   return placed;
 }
-function priceChart(data,selectedFrame){
+function svgPriceChart(data,selectedFrame){
   const series=data.chart_timeframes||{};
   const fallback=(data.chart_points||[]).map(p=>({timestamp:p.timestamp,open:p.close,high:p.close,low:p.close,close:p.close}));
   const available=chartFrames.filter(frame=>(series[frame]||[]).length>1);
@@ -96,6 +96,64 @@ function priceChart(data,selectedFrame){
   const quote=location.pathname.split('/')[2]?.startsWith('crypto_')?'USDT':'';
   return `<div class="price-chart" data-active-frame="${safe(frame)}" data-hover-enabled="true">${buttons}<div class="chart-stage"><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${safe(frame)} candlestick price chart"><g class="chart-grid-layer">${grid}</g><g class="chart-volume" aria-label="Volume">${volumes}</g>${candles}<g class="chart-crosshair" aria-hidden="true"><line class="crosshair-x" x1="0" x2="0" y1="${top}" y2="${priceBottom}"/><line class="crosshair-y" x1="${left}" x2="${plotRight}" y1="0" y2="0"/></g>${overlays}</svg><div class="chart-tooltip" role="status" aria-live="polite" data-quote="${quote}" hidden><strong data-field="time">—</strong><div><span>Open</span><b data-field="open">—</b></div><div><span>High</span><b data-field="high">—</b></div><div><span>Low</span><b data-field="low">—</b></div><div><span>Close</span><b data-field="close">—</b></div><div><span>Volume</span><b data-field="volume">—</b></div></div></div><div class="chart-caption"><span>${bars.length} candles · hover or tap for OHLCV</span><span>High ${number(max)} · Low ${number(min)}</span></div></div>`;
 }
+const LIGHTWEIGHT_CHARTS_URL='https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js';
+let lightweightChartsPromise;
+function loadLightweightCharts(){
+  if(window.LightweightCharts)return Promise.resolve(window.LightweightCharts);
+  if(!lightweightChartsPromise)lightweightChartsPromise=new Promise((resolve,reject)=>{
+    const script=document.createElement('script');script.src=LIGHTWEIGHT_CHARTS_URL;script.async=true;script.crossOrigin='anonymous';
+    script.onload=()=>window.LightweightCharts?resolve(window.LightweightCharts):reject(new Error('Lightweight Charts did not initialize'));
+    script.onerror=()=>reject(new Error('Lightweight Charts failed to load'));document.head.appendChild(script);
+  });
+  return lightweightChartsPromise;
+}
+function chartTime(value){
+  if(typeof value==='number'||/^\d+(\.\d+)?$/.test(String(value))){const numeric=Number(value);return Math.floor(numeric>1e12?numeric/1000:numeric)}
+  const parsed=Date.parse(value);return Number.isFinite(parsed)?Math.floor(parsed/1000):null;
+}
+function mapCandlesToLightweight(bars){
+  const mapped=(bars||[]).map(bar=>({time:chartTime(bar.timestamp??bar.time),open:Number(bar.open),high:Number(bar.high),low:Number(bar.low),close:Number(bar.close)})).filter(bar=>bar.time!=null&&['open','high','low','close'].every(key=>Number.isFinite(bar[key]))).sort((a,b)=>a.time-b.time);
+  return mapped.filter((bar,index)=>!index||bar.time!==mapped[index-1].time);
+}
+function mapVolumeToLightweight(bars){
+  return (bars||[]).map(bar=>({time:chartTime(bar.timestamp??bar.time),value:Number(bar.volume),color:Number(bar.close)>=Number(bar.open)?'rgba(36, 211, 149, .38)':'rgba(255, 91, 111, .38)'})).filter(bar=>bar.time!=null&&Number.isFinite(bar.value)&&bar.value>=0).sort((a,b)=>a.time-b.time);
+}
+function selectedChartData(data,selectedFrame){
+  const series=data.chart_timeframes||{},fallback=(data.chart_points||[]).map(p=>({timestamp:p.timestamp,open:p.close,high:p.close,low:p.close,close:p.close}));
+  const available=chartFrames.filter(frame=>(series[frame]||[]).length>1),frame=(selectedFrame&&available.includes(selectedFrame)?selectedFrame:null)||data.chart_default_timeframe||available[0];
+  return {series,available,frame,bars:series[frame]||fallback};
+}
+function chartToolbar(series,frame){return `<div class="chart-toolbar"><div><p class="eyebrow">MARKET CHART</p><strong>${safe(frame||'Price history')}</strong></div><div class="timeframe-buttons" role="group" aria-label="Chart timeframe">${chartFrames.map(item=>`<button type="button" data-chart-frame="${item}" class="${item===frame?'active':''}" ${series[item]?.length>1?'':'disabled'}>${item}</button>`).join('')}</div></div>`}
+function priceChart(data,selectedFrame){
+  const {series,frame,bars}=selectedChartData(data,selectedFrame),candles=mapCandlesToLightweight(bars);
+  const buttons=chartToolbar(series,frame);
+  if(candles.length<2)return `<div class="price-chart">${buttons}<div class="chart-unavailable"><span>Chart unavailable</span><small>Candle history is not available for this asset.</small></div></div>`;
+  return `<div class="price-chart lightweight-price-chart" data-active-frame="${safe(frame)}">${buttons}<div class="advanced-chart-shell"><div class="lightweight-chart-container" role="img" aria-label="${safe(frame)} interactive candlestick chart"></div><div class="lightweight-ohlc" role="status" aria-live="polite"></div></div><div class="chart-fallback" hidden>${svgPriceChart(data,frame)}<p class="fallback-note">Advanced chart unavailable; showing basic chart.</p></div><div class="chart-level-legend" aria-label="Chart price levels"></div><a class="chart-attribution" href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">Charts by TradingView</a></div>`;
+}
+function priceLineConfiguration(data,bars){
+  const levels=[['Support',data.key_levels?.support,'#24d395'],['Resistance',data.key_levels?.resistance,'#f7bd52'],['Stop',data.key_levels?.stop_loss,'#ff5b6f'],['Take profit',data.key_levels?.take_profit,'#559cff'],['Current',data.live_price??data.market?.price,'#d8e5ef']];
+  const prices=mapCandlesToLightweight(bars).flatMap(bar=>[bar.high,bar.low]),low=Math.min(...prices),high=Math.max(...prices),range=high-low||Math.abs(high)||1;
+  return levels.map(([title,value,color])=>({title,price:Number(value),color,lineWidth:title==='Current'?2:1,lineStyle:title==='Current'?0:2,axisLabelVisible:true,inScale:Number.isFinite(Number(value))&&Number(value)>=low-range*.35&&Number(value)<=high+range*.35})).filter(level=>Number.isFinite(level.price));
+}
+function showSvgFallback(container){
+  container.querySelector('.advanced-chart-shell')?.setAttribute('hidden','');const fallback=container.querySelector('.chart-fallback');if(fallback){fallback.hidden=false;bindChartHover(fallback)}
+}
+async function mountLightweightChart(container,data,selectedFrame){
+  const target=container.querySelector('.lightweight-chart-container');if(!target)return;
+  try{
+    const LC=await loadLightweightCharts();if(!target.isConnected)return;
+    const {bars}=selectedChartData(data,selectedFrame),candles=mapCandlesToLightweight(bars),volume=mapVolumeToLightweight(bars);
+    const chart=LC.createChart(target,{autoSize:false,layout:{background:{type:'solid',color:'#071722'},textColor:'#8fa7b9',fontFamily:'Inter,system-ui,sans-serif'},grid:{vertLines:{color:'#122a39'},horzLines:{color:'#122a39'}},crosshair:{mode:LC.CrosshairMode.Normal},rightPriceScale:{visible:true,borderColor:'#294252',scaleMargins:{top:.08,bottom:volume.length?.23:.08}},timeScale:{visible:true,borderColor:'#294252',timeVisible:true,secondsVisible:false,rightOffset:5,barSpacing:8},handleScroll:true,handleScale:true});
+    const candleSeries=chart.addCandlestickSeries({upColor:'#24d395',downColor:'#ff5b6f',borderUpColor:'#24d395',borderDownColor:'#ff5b6f',wickUpColor:'#24d395',wickDownColor:'#ff5b6f',priceLineVisible:false,lastValueVisible:true});candleSeries.setData(candles);
+    if(volume.length){const volumeSeries=chart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'volume',lastValueVisible:false,priceLineVisible:false});volumeSeries.priceScale().applyOptions({scaleMargins:{top:.78,bottom:0}});volumeSeries.setData(volume)}
+    const levels=priceLineConfiguration(data,bars),legend=container.querySelector('.chart-level-legend');
+    levels.filter(level=>level.inScale).forEach(level=>candleSeries.createPriceLine(level));legend.innerHTML=levels.map(level=>`<span style="--level-color:${level.color}"><i></i>${safe(level.title)} <b>${number(level.price)}</b>${level.inScale?'':' · off scale'}</span>`).join('');
+    const ohlc=container.querySelector('.lightweight-ohlc'),renderOhlc=bar=>{ohlc.innerHTML=bar?`<span>O <b>${number(bar.open)}</b></span><span>H <b>${number(bar.high)}</b></span><span>L <b>${number(bar.low)}</b></span><span>C <b>${number(bar.close)}</b></span>`:''};renderOhlc(candles.at(-1));
+    chart.subscribeCrosshairMove(param=>renderOhlc(param.seriesData.get(candleSeries)||candles.at(-1)));
+    const resize=()=>chart.applyOptions({width:target.clientWidth,height:Math.max(300,Math.min(440,target.clientWidth*.54))});resize();const observer=new ResizeObserver(resize);observer.observe(target);chart.timeScale().fitContent();
+    container._chartCleanup=()=>{observer.disconnect();chart.remove()};
+  }catch(error){showSvgFallback(container)}
+}
 function bindChartHover(container){
   const stage=container.querySelector('.chart-stage'),svg=stage?.querySelector('svg'),tooltip=stage?.querySelector('.chart-tooltip'),candles=[...(svg?.querySelectorAll('[data-candle-index]')||[])];
   if(!stage||!svg||!tooltip||!candles.length)return;
@@ -108,7 +166,10 @@ function bindChartHover(container){
   };
   stage.addEventListener('pointermove',show);stage.addEventListener('pointerdown',show);stage.addEventListener('pointerleave',event=>{if(event.pointerType!=='touch')hide()});
 }
-function bindChartTimeframes(container,data){bindChartHover(container);container.querySelectorAll('[data-chart-frame]:not(:disabled)').forEach(button=>button.onclick=()=>{container.innerHTML=priceChart(data,button.dataset.chartFrame);bindChartTimeframes(container,data)})}
+function bindChartTimeframes(container,data){
+  mountLightweightChart(container,data,container.querySelector('.price-chart')?.dataset.activeFrame);
+  container.querySelectorAll('[data-chart-frame]:not(:disabled)').forEach(button=>button.onclick=()=>{container._chartCleanup?.();container.innerHTML=priceChart(data,button.dataset.chartFrame);bindChartTimeframes(container,data)})
+}
 
 function signalPanel(data,label){const side=data.signal.side;const market=location.pathname.split('/')[2]||'';const quote=market.startsWith('crypto_')?'USDT':'USD';const marketData=data.market||{};const liveTitle=market.startsWith('crypto_')?data.symbol.replace(/USDT$/,'/USDT')+' live price':data.display_name+' live price';const updated=data.last_updated?new Date(data.last_updated).toLocaleString():'—';const metrics=[['Probability',data.signal.probability==null?null:Math.round(data.signal.probability*100)+'%'],['Risk score',data.signal.risk_score==null?null:Math.round(data.signal.risk_score*100)+'/100'],['Stop loss',data.signal.stop_loss==null?null:number(data.signal.stop_loss)],['Take profit',data.signal.take_profit==null?null:number(data.signal.take_profit)],['Position size',data.signal.position_size_pct==null?null:(data.signal.position_size_pct*100).toFixed(1)+'%']].filter(x=>x[1]!=null);return `<section class="detail-grid signal-price-grid"><article class="panel signal-card"><p class="eyebrow">${label}</p><div class="decision ${side.includes('BUY')?'positive':side.includes('SELL')?'negative':''}">${safe(side)}</div><div class="live-price"><small>${safe(liveTitle)}</small><strong>${number(data.live_price??marketData.price)} <em>${quote}</em></strong><div><span class="${(data.change_24h??marketData.change_24h)>=0?'positive':'negative'}">24h ${pct(data.change_24h??marketData.change_24h)}</span><span>Volume ${money(data.volume??marketData.volume)}</span></div><p>Source: ${safe(data.source||marketData.source)} · Last updated: ${safe(updated)}</p></div><p>Confidence ${Math.round(data.signal.confidence*100)}%</p><div class="confidence-bar"><span style="width:${Math.round(data.signal.confidence*100)}%"></span></div>${metrics.map(x=>`<p><b>${x[0]}:</b> ${x[1]}</p>`).join('')}</article><article class="panel chart-card"><div class="chart-mount">${priceChart(data)}</div></article></section><section class="panel reasoning-panel"><p class="eyebrow">PLAIN-LANGUAGE REASONING</p><div class="plain-copy">${safe(data.plain_language_reason||data.signal.rationale)}</div></section>`}
 

@@ -175,11 +175,48 @@ def test_chart_hover_tooltip_contains_ohlcv_and_bounded_positioning():
     assert "pointerdown" in javascript
 
 
-def test_timeframe_switching_rebinds_chart_hover():
+def test_timeframe_switching_updates_and_remounts_advanced_chart():
     javascript = TestClient(app).get("/assets/app.js").text
-    assert "function bindChartHover" in javascript
-    assert "function bindChartTimeframes(container,data){bindChartHover(container)" in javascript
+    assert "function bindChartTimeframes" in javascript
+    assert "container._chartCleanup?.()" in javascript
     assert "container.innerHTML=priceChart(data,button.dataset.chartFrame);bindChartTimeframes" in javascript
+    assert "chart.timeScale().fitContent()" in javascript
+
+
+def test_lightweight_chart_is_lazy_loaded_and_has_svg_fallback():
+    javascript = TestClient(app).get("/assets/app.js").text
+    html = TestClient(app).get("/").text
+    assert "lightweight-charts@4.2.3" in javascript
+    assert "loadLightweightCharts" in javascript
+    assert "lightweight-chart-container" in javascript
+    assert "svgPriceChart(data,frame)" in javascript
+    assert "Advanced chart unavailable; showing basic chart." in javascript
+    assert "lightweight-charts" not in html  # overview boot does not download the chart library
+
+
+def test_lightweight_chart_maps_ohlc_volume_and_financial_features():
+    javascript = TestClient(app).get("/assets/app.js").text
+    assert "function mapCandlesToLightweight" in javascript
+    assert "time:chartTime" in javascript
+    for field in ("open:Number", "high:Number", "low:Number", "close:Number"):
+        assert field in javascript
+    assert "function mapVolumeToLightweight" in javascript
+    assert "chart.addHistogramSeries" in javascript
+    assert "chart.addCandlestickSeries" in javascript
+    assert "subscribeCrosshairMove" in javascript
+    assert "rightPriceScale:{visible:true" in javascript
+    assert "timeScale:{visible:true" in javascript
+    assert "new ResizeObserver" in javascript
+
+
+def test_price_lines_protect_scale_and_all_timeframes_are_present():
+    javascript = TestClient(app).get("/assets/app.js").text
+    assert "function priceLineConfiguration" in javascript
+    for level in ("Support", "Resistance", "Stop", "Take profit", "Current"):
+        assert f"['{level}'" in javascript
+    assert "levels.filter(level=>level.inScale)" in javascript
+    assert "off scale" in javascript
+    assert "data-chart-frame" in javascript and "?'':'disabled'" in javascript
 
 
 def test_deep_completed_and_fallback_views_stay_compact_and_compare_signals():
