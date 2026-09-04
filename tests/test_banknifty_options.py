@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from tradebot.app import app
-from tradebot.banknifty_options import atm_strike, build_chain
+from tradebot.banknifty_options import NSEOptionChainClient, atm_strike, build_chain
 from tradebot.models import MarketKind, MarketSnapshot
 
 client = TestClient(app)
@@ -24,12 +24,47 @@ def test_banknifty_options_route_exists():
 
 
 def test_unavailable_provider_state_does_not_crash_or_return_fake_rows():
-    with patch("tradebot.app.OpenBBClient.option_chain", side_effect=RuntimeError("not supported")):
+    with (patch("tradebot.app.OpenBBClient.option_chain", side_effect=RuntimeError("not supported")),
+          patch("tradebot.app.NSEOptionChainClient.option_chain", side_effect=RuntimeError("blocked"))):
         response = client.get("/api/banknifty-options")
     assert response.status_code == 200
     assert response.json()["message"] == "Bank Nifty options data provider not configured yet."
     assert response.json()["contracts"] == []
     assert response.json()["available"] is False
+
+
+def test_openbb_empty_response_triggers_nse_fallback():
+    nse = {"source": "NSE fallback", "underlying_price": 51020, "contracts": RAW["contracts"]}
+    with (patch("tradebot.app.OpenBBClient.option_chain", return_value={"contracts": []}),
+          patch("tradebot.app.NSEOptionChainClient.option_chain", return_value=nse) as fallback):
+        response = client.get("/api/banknifty-options")
+    assert response.status_code == 200
+    assert response.json()["available"] is True
+    assert response.json()["source"] == "NSE fallback"
+    assert response.json()["contracts"]
+    fallback.assert_called_once_with(None)
+
+
+def test_nse_response_normalizes_to_option_contract(monkeypatch):
+    payload = {"records": {"underlyingValue": 51020, "expiryDates": ["10-Sep-2026"], "data": [{
+        "expiryDate": "10-Sep-2026", "strikePrice": 51000,
+        "CE": {"lastPrice": 200, "change": 3, "totalTradedVolume": 100,
+               "openInterest": 1000, "impliedVolatility": 18, "bidprice": 199,
+               "askPrice": 201}}]}}
+    client_instance = NSEOptionChainClient(retries=0)
+    responses = iter([{}, payload])
+    monkeypatch.setattr(client_instance, "_open_json", lambda *args, **kwargs: next(responses))
+    raw = client_instance.option_chain()
+    result = build_chain(raw, raw["underlying_price"])
+    contract = result["contracts"][0]
+    assert contract["expiry"] == "10-Sep-2026"
+    assert contract["option_type"] == "CE"
+    assert contract["strike"] == 51000
+    assert contract["last_price"] == 200
+    assert contract["open_interest"] == 1000
+    assert contract["underlying_price"] == 51020
+    assert contract["moneyness"] == "ATM"
+    assert contract["distance_from_spot_pct"] == -0.0392
 
 
 def test_ce_pe_and_moneyness_filtering():
