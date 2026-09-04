@@ -29,6 +29,9 @@ class TradingService:
         decision = self.risk.evaluate(signal, market, equity,
                                       self.broker.positions.get(symbol.upper(), 0))
         result = {"market": asdict(market), "signal": asdict(signal), "risk": asdict(decision)}
+        if signal.model == "safe_fallback":
+            result["ai_available"] = False
+            result["ai_notice"] = "AI temporarily unavailable. Showing live market data only."
         if errors:
             result["warnings"] = errors
         if decision.approved and decision.intent:

@@ -35,6 +35,10 @@ def default_registry() -> VenueRegistry:
     registry.register(MarketKind.CRYPTO_SPOT, "weex", lambda: research_fallbacks(WeexSpotMarketData))
     registry.register(MarketKind.CRYPTO_FUTURES, "weex", lambda: research_fallbacks(WeexFuturesMarketData))
     # OpenBB is the normalized research/data route for non-crypto markets.
-    for market in (MarketKind.EQUITIES, MarketKind.FOREX, MarketKind.COMMODITIES, MarketKind.OPTIONS):
-        registry.register(market, "openbb", OpenBBClient)
+    for market in (MarketKind.EQUITIES, MarketKind.FOREX, MarketKind.COMMODITIES):
+        asset_class = {MarketKind.EQUITIES: "equity", MarketKind.FOREX: "currency",
+                       MarketKind.COMMODITIES: "commodity"}[market]
+        registry.register(market, "openbb", lambda kind=asset_class: FallbackMarketData(
+            OpenBBClient(asset_class=kind), YahooFinanceClient()))
+    registry.register(MarketKind.OPTIONS, "openbb", lambda: OpenBBClient(asset_class="equity"))
     return registry

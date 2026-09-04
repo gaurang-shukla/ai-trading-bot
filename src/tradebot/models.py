@@ -33,6 +33,8 @@ class MarketSnapshot:
     price: float
     as_of: str
     source: str
+    change_24h: float | None = None
+    volume: float | None = None
 
 
 @dataclass(frozen=True)
