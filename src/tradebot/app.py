@@ -1,17 +1,22 @@
 import importlib.util
 import os
 import secrets
+import json
 import webbrowser
+from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .adapters import CachedSignalProvider, PaperclipReporter, TradingAgentsClient
+from .adapters import CachedSignalProvider, OpenBBClient, PaperclipReporter, TradingAgentsClient
+from .diagnostics import diagnostics
 from .config import load_project_env
 from .execution import PaperBroker
 from .models import MarketKind, MarketSelection
@@ -73,6 +78,7 @@ def integration_status() -> dict:
             "installed": True,
             "configured": paperclip_configured,
             "ready": paperclip_configured,
+            "enabled": paperclip.enabled or bool(os.getenv("PAPERCLIP_BRIDGE_TOKEN")),
             "role": "audit and orchestration bridge",
         },
         "weex": {
@@ -86,8 +92,62 @@ def integration_status() -> dict:
     }
 
 
+def verify_openai_model() -> None:
+    """Ask OpenAI whether the configured model is available to this API key."""
+    key = os.getenv("OPENAI_API_KEY", "")
+    if not key:
+        return
+    model = os.getenv("OPENAI_MODEL", "") or "gpt-4o-mini"
+    request = Request(f"https://api.openai.com/v1/models/{quote(model, safe='')}",
+                      headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urlopen(request, timeout=10) as response:
+            payload = json.load(response)
+        if payload.get("id") != model:
+            raise RuntimeError(f"OpenAI returned an unexpected model id for {model}")
+        diagnostics.success("openai")
+    except Exception as exc:
+        diagnostics.failure("openai", exc)
+
+
+def startup_diagnostics() -> None:
+    """Print a safe, secret-free integration inventory on every server start."""
+    from importlib import metadata
+    try:
+        graph_class = __import__("tradebot.adapters", fromlist=["_import_attribute"])._import_attribute((
+            ("tradingagents.graph.trading_graph", "TradingAgentsGraph"),
+            ("tradingagents.graph", "TradingAgentsGraph"),
+            ("tradingagents", "TradingAgentsGraph"),
+        ))
+        imported, module_path = True, f"{graph_class.__module__}.{graph_class.__name__}"
+    except Exception as exc:
+        imported, module_path = False, f"unavailable ({type(exc).__name__}: {exc})"
+    try:
+        version = metadata.version("tradingagents")
+    except metadata.PackageNotFoundError:
+        version = "not-installed"
+    paperclip = PaperclipReporter()
+    print(f"OpenAI model: {os.getenv('OPENAI_MODEL', '') or 'gpt-4o-mini'}", flush=True)
+    print(f"OpenAI key loaded: {bool(os.getenv('OPENAI_API_KEY'))}", flush=True)
+    print(f"TradingAgents imported: {imported}", flush=True)
+    print(f"TradingAgents version: {version}", flush=True)
+    print(f"Configured LLM: {os.getenv('OPENAI_MODEL', '') or 'gpt-4o-mini'}", flush=True)
+    print(f"module path: {module_path}", flush=True)
+    print(f"package version: {version}", flush=True)
+    print(f"loaded classes: {module_path if imported else 'none'}", flush=True)
+    print(f"Paperclip enabled: {paperclip.enabled}", flush=True)
+    print("WEEX enabled: True", flush=True)
+    print(f"OpenBB enabled: {bool(os.getenv('OPENBB_API_URL'))}", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    startup_diagnostics()
+    yield
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="Signal", version="0.4.0")
+    app = FastAPI(title="Signal", version="0.4.0", lifespan=lifespan)
     app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
 
     @app.get("/")
@@ -105,6 +165,27 @@ def create_app() -> FastAPI:
     @app.get("/api/status")
     def status():
         return {"mode": "paper", "integrations": integration_status()}
+
+    @app.get("/debug")
+    def debug():
+        verify_openai_model()
+        states = integration_status()
+        result = diagnostics.snapshot(("openai", "tradingagents", "openbb", "weex", "yahoo", "paperclip"))
+        for name, item in result.items():
+            item["configured"] = states.get(name, {}).get("configured", name in {"weex", "yahoo"})
+            if not item["configured"] and item["status"] == "not_checked":
+                item["status"] = "disabled" if name == "paperclip" else "not_configured"
+        result["openai"].update(model=os.getenv("OPENAI_MODEL", "") or "gpt-4o-mini",
+                                api_key_loaded=bool(os.getenv("OPENAI_API_KEY")))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/options/{symbol}")
+    def options(symbol: str, expiration: str | None = None):
+        try:
+            return OpenBBClient().option_chain(symbol, expiration)
+        except Exception as exc:
+            diagnostics.failure("openbb", exc)
+            raise HTTPException(502, f"Option chain could not load: {type(exc).__name__}: {exc}") from exc
 
     @app.get("/api/markets")
     def markets():
@@ -158,7 +239,7 @@ def create_app() -> FastAPI:
 
     @app.get("/{path:path}")
     def app_route(path: str):
-        if path.startswith("api/"):
+        if path.startswith("api/") or path == "debug":
             raise HTTPException(404, "API route not found")
         return FileResponse(WEB_DIR / "index.html")
 

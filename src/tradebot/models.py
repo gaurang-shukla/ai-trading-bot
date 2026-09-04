@@ -5,7 +5,9 @@ from typing import Any
 
 
 class Side(str, Enum):
+    STRONG_BUY = "STRONG BUY"
     BUY = "BUY"
+    STRONG_SELL = "STRONG SELL"
     SELL = "SELL"
     HOLD = "HOLD"
 
@@ -44,6 +46,11 @@ class TradeSignal:
     confidence: float
     rationale: str
     model: str
+    risk_score: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    probability: float | None = None
+    position_size_pct: float | None = None
 
 
 @dataclass(frozen=True)

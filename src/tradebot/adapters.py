@@ -4,12 +4,14 @@ import logging
 import os
 import threading
 import time
+from importlib import metadata
 from datetime import date, datetime, timezone
 from typing import Protocol
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from .models import MarketSnapshot, Side, TradeSignal
+from .diagnostics import diagnostics
 
 
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
@@ -58,6 +60,26 @@ class OpenBBClient:
         volume = row.get("volume") or row.get("regular_market_volume")
         return MarketSnapshot(symbol.upper(), float(price), row.get("last_trade_timestamp", date.today().isoformat()),
                               "OpenBB", _optional_float(change), _optional_float(volume))
+
+    def option_chain(self, symbol: str, expiration: str | None = None) -> dict:
+        params = {"symbol": symbol.upper()}
+        if expiration:
+            params["expiration"] = expiration
+        url = f"{self.base_url}/api/v1/derivatives/options/chains?{urlencode(params)}"
+        with urlopen(url, timeout=20) as response:
+            payload = json.load(response)
+        rows = payload if isinstance(payload, list) else payload.get("results", payload.get("data", []))
+        if isinstance(rows, dict):
+            rows = rows.get("results", [])
+        normalized = [_normalize_option(row) for row in rows]
+        normalized = [row for row in normalized if row.get("strike") is not None]
+        expiries = sorted({row["expiration"] for row in normalized if row.get("expiration")})
+        strikes = sorted({row["strike"] for row in normalized})
+        calls = sum((row.get("open_interest") or 0) for row in normalized if row.get("option_type") == "call")
+        puts = sum((row.get("open_interest") or 0) for row in normalized if row.get("option_type") == "put")
+        return {"symbol": symbol.upper(), "source": "OpenBB", "expiries": expiries,
+                "strikes": strikes, "put_call_ratio": puts / calls if calls else None,
+                "max_pain": _max_pain(normalized), "contracts": normalized}
 
 
 class YahooFinanceClient:
@@ -110,6 +132,11 @@ class FallbackMarketData:
             try:
                 result = provider.snapshot(symbol)
                 logger.info("%s\nProvider: %s", symbol.upper(), result.source)
+                source = ("weex" if result.source.lower().startswith("weex") else
+                          "yahoo" if "yahoo" in result.source.lower() else
+                          "openbb" if "openbb" in result.source.lower() else None)
+                if source:
+                    diagnostics.success(source)
                 return result
             except Exception as exc:
                 reason = f"{type(provider).__name__}: {type(exc).__name__}: {exc}"
@@ -172,6 +199,7 @@ class TradingAgentsClient:
 
     def analyze(self, symbol: str, as_of: str) -> TradeSignal:
         try:
+            logger.info("TradingAgents stage=model_initialization start")
             graph_class = _import_attribute((
                 ("tradingagents.graph.trading_graph", "TradingAgentsGraph"),
                 ("tradingagents.graph", "TradingAgentsGraph"),
@@ -187,16 +215,53 @@ class TradingAgentsClient:
                 ))
                 config = default.copy()
             config = _bounded_tradingagents_config(config)
+            provider = str(config.get("llm_provider", "openai")).lower()
+            key_name = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
+                        "google": "GOOGLE_API_KEY", "groq": "GROQ_API_KEY",
+                        "deepseek": "DEEPSEEK_API_KEY", "openrouter": "OPENROUTER_API_KEY"}.get(provider)
+            key_loaded = bool(key_name and os.getenv(key_name))
+            logger.info("TradingAgents stage=api_key_loading provider=%s env=%s loaded=%s",
+                        provider, key_name, key_loaded)
+            if not key_loaded:
+                raise RuntimeError(f"{key_name or provider + ' API key'} is not configured")
+            model = os.getenv("OPENAI_MODEL", "") or str(config.get("quick_think_llm") or "gpt-4o-mini")
+            if provider == "openai":
+                config["quick_think_llm"] = model
+                config["deep_think_llm"] = os.getenv("OPENAI_DEEP_MODEL", "") or model
+            logger.info("TradingAgents stage=model_initialization package=%s provider=%s model=%s graph=%s",
+                        _package_version("tradingagents"), provider, model, graph_class.__module__)
+            logger.info("TradingAgents stage=prompt_creation symbol=%s research_symbol=%s as_of=%s",
+                        symbol.upper(), research_symbol(symbol), as_of)
+            call_header = (f"Starting AI analysis...\nsymbol: {symbol.upper()}\n"
+                           f"model: {model}\nprovider: {provider}")
+            print(call_header, flush=True)
+            logger.info(call_header)
             graph = graph_class(debug=False, config=config)
+            logger.info("TradingAgents stage=llm_request start model=%s", model)
             _, decision = graph.propagate(research_symbol(symbol), as_of)
+            logger.info("TradingAgents stage=llm_request complete response_type=%s", type(decision).__name__)
             raw = str(decision).upper()
-            side = Side.BUY if "BUY" in raw else Side.SELL if "SELL" in raw else Side.HOLD
-            confidence = 0.75 if side is not Side.HOLD else 0.0
-            return TradeSignal(symbol.upper(), side, confidence, str(decision), "TradingAgents")
+            logger.info("TradingAgents stage=response_parsing characters=%d", len(raw))
+            side = _parse_side(raw)
+            confidence = _extract_metric(raw, "CONFIDENCE", .82 if "STRONG" in side.value else .72)
+            risk_score = _extract_metric(raw, "RISK SCORE", 1 - confidence)
+            probability = _extract_metric(raw, "PROBABILITY", confidence)
+            size = _extract_metric(raw, "POSITION SIZE", max(0.01, (1-risk_score) * .05))
+            logger.info("TradingAgents stage=signal_generation side=%s confidence=%.3f", side.value, confidence)
+            completion = f"AI completed\n{side.value}\nconfidence {confidence:.3f}"
+            print(completion, flush=True)
+            logger.info(completion)
+            diagnostics.success("tradingagents")
+            diagnostics.success("openai" if provider == "openai" else provider)
+            return TradeSignal(symbol.upper(), side, confidence, str(decision), model, risk_score,
+                               _extract_number(raw, "STOP LOSS"), _extract_number(raw, "TAKE PROFIT"), probability, size)
         except Exception as exc:
-            logger.warning("AI analysis failed for %s: %s: %s", symbol.upper(), type(exc).__name__, exc)
+            diagnostics.failure("tradingagents", exc)
+            if "provider" in locals():
+                diagnostics.failure("openai" if provider == "openai" else provider, exc)
+            logger.exception("FULL PYTHON TRACEBACK\nTradingAgents pipeline failed for %s", symbol.upper())
             return TradeSignal(symbol.upper(), Side.HOLD, 0.0,
-                               "AI temporarily unavailable. Showing live market data only.",
+                               f"AI failed: {type(exc).__name__}: {exc}",
                                "safe_fallback")
 
 
@@ -212,6 +277,55 @@ def _bounded_tradingagents_config(config: dict) -> dict:
         values["max_tokens"] = max_tokens
         bounded[key] = values
     return bounded
+
+
+def _package_version(name: str) -> str:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return "not-installed"
+
+
+def _parse_side(raw: str) -> Side:
+    import re
+    match = re.search(r"\b(STRONG\s+BUY|STRONG\s+SELL|BUY|SELL|HOLD)\b", raw)
+    return Side(match.group(1)) if match else Side.HOLD
+
+
+def _extract_metric(raw: str, label: str, default: float) -> float:
+    import re
+    match = re.search(rf"{label}\s*[:=-]?\s*(\d+(?:\.\d+)?)\s*%?", raw)
+    if not match:
+        return default
+    value = float(match.group(1))
+    return min(1.0, max(0.0, value / 100 if value > 1 else value))
+
+def _extract_number(raw: str, label: str) -> float | None:
+    import re
+    match = re.search(rf"{label}\s*[:=-]?\s*\$?([\d,]+(?:\.\d+)?)", raw)
+    return float(match.group(1).replace(",", "")) if match else None
+
+def _normalize_option(row: dict) -> dict:
+    def first(*keys):
+        return next((row[k] for k in keys if row.get(k) is not None), None)
+    return {"expiration": first("expiration", "expiration_date"),
+            "strike": _optional_float(first("strike", "strike_price")),
+            "option_type": str(first("option_type", "type") or "").lower(),
+            "open_interest": _optional_float(first("open_interest", "openInterest")),
+            "iv": _optional_float(first("implied_volatility", "iv")),
+            "delta": _optional_float(first("delta")), "gamma": _optional_float(first("gamma")),
+            "theta": _optional_float(first("theta")), "vega": _optional_float(first("vega")),
+            "last_price": _optional_float(first("last_price", "last"))}
+
+
+def _max_pain(rows: list[dict]) -> float | None:
+    strikes = {row["strike"] for row in rows if row.get("strike") is not None}
+    if not strikes:
+        return None
+    def payout(at):
+        return sum((max(0, at-r["strike"]) if r.get("option_type") == "call" else
+                    max(0, r["strike"]-at)) * (r.get("open_interest") or 0) for r in rows)
+    return min(strikes, key=payout)
 
 
 class CachedSignalProvider:
@@ -268,9 +382,18 @@ class PaperclipReporter:
         body = json.dumps(event).encode()
         request = Request(endpoint, data=body, method="POST", headers={
             "Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"})
-        with urlopen(request, timeout=10):
-            pass
+        try:
+            with urlopen(request, timeout=10):
+                pass
+            diagnostics.success("paperclip")
+        except Exception as exc:
+            diagnostics.failure("paperclip", exc)
+            raise
 
     @property
     def configured(self) -> bool:
         return bool(os.getenv("PAPERCLIP_TASK_BRIDGE_URL", "") and self.api_key)
+
+    @property
+    def enabled(self) -> bool:
+        return os.getenv("PAPERCLIP_ENABLED", "").lower() in {"1", "true", "yes"} or self.configured

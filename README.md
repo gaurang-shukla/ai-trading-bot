@@ -104,6 +104,29 @@ provider) become safe HOLD results. TradingAgents requires an enabled LLM provid
 for full analysis. Paperclip reporting is disabled
 unless `PAPERCLIP_TASK_BRIDGE_URL` and its scoped key are explicitly configured.
 
+Set `OPENAI_MODEL` to the model available to your OpenAI project (the default is
+`gpt-4o-mini`). The `/debug` endpoint validates that model against OpenAI when a key is
+present and reports OpenAI, TradingAgents, OpenBB, WEEX, Yahoo and Paperclip health,
+including the last success and exact last error. TradingAgents also logs each pipeline
+stage without logging secret values. Paperclip remains hidden in the home-page health
+strip until its inbound or outbound bridge is explicitly enabled.
+
+The options asset view obtains its chain from OpenBB and exposes expiration and strike
+selection, open interest, implied volatility, available Greeks, put/call ratio and max
+pain. Fields without provider data are rendered as unavailable cells, while selectors
+and summary widgets with no data are omitted.
+
+Run the two upstream smoke tests independently before debugging the full application:
+
+```bash
+python scripts/test_openai.py
+python scripts/test_tradingagents.py
+```
+
+Both use the same `.env` and `OPENAI_MODEL` as the server, print their raw response,
+and exit nonzero with a complete Python traceback if an import, credential, model, or
+upstream request fails.
+
 ## Safety gates before any live broker
 
 1. Immutable event/audit storage and idempotency keys.
