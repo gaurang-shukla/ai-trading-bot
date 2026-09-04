@@ -3,6 +3,7 @@ import os
 import secrets
 import json
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
@@ -16,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
-from .analysis import DeepAnalysisCache, QuickSignalEngine
+from .analysis import CandleCache, DeepAnalysisCache, QuickSignalEngine, TIMEFRAMES
 from .diagnostics import diagnostics
 from .config import load_project_env
 from .execution import PaperBroker
@@ -34,6 +35,7 @@ load_project_env()
 signals = TradingAgentsClient()
 quick_signals = QuickSignalEngine()
 deep_cache = DeepAnalysisCache()
+candle_cache = CandleCache()
 
 
 class AnalyzeRequest(BaseModel):
@@ -235,8 +237,25 @@ def create_app() -> FastAPI:
     @app.post("/api/analyze/quick")
     def quick_analyze(request: AnalyzeRequest):
         try:
-            snapshot = market_data(request).snapshot(request.symbol.upper())
-            result = quick_signals.analyze(snapshot, request.equity)
+            provider = market_data(request)
+            symbol = request.symbol.upper()
+            snapshot = provider.snapshot(symbol)
+            histories, warnings = {}, []
+            # Timeframes load concurrently under a tight provider timeout. A partial
+            # response is useful and a total candle failure retains the old fast path.
+            with ThreadPoolExecutor(max_workers=len(TIMEFRAMES)) as executor:
+                futures = {executor.submit(candle_cache.get_or_load, f"{request.market.value}:{symbol}", frame,
+                           lambda f=frame: provider.candles(symbol, f, 250)): frame
+                           for frame in TIMEFRAMES}
+                for future in as_completed(futures):
+                    frame = futures[future]
+                    try:
+                        histories[frame] = future.result()
+                    except Exception as exc:
+                        warnings.append(f"{frame} candles unavailable: {type(exc).__name__}")
+            result = quick_signals.analyze(snapshot, request.equity, histories)
+            if warnings:
+                result["warnings"] = warnings
             result["notice"] = "Deterministic quick signal only. No AI or live order was used."
             return result
         except Exception as exc:
