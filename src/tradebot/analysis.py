@@ -226,3 +226,67 @@ class DeepAnalysisCache:
     def _response(entry: tuple[float, str, dict], cached: bool) -> dict:
         return {**entry[2], "mode": "deep", "cached": cached,
                 "deep_analyzed_at": entry[1]}
+
+
+def normalize_deep_reasoning(deep: dict, quick: dict) -> dict:
+    """Keep good agent prose, but expand terse decisions using deterministic evidence."""
+    signal = deep.setdefault("signal", {})
+    rationale = str(signal.get("rationale") or deep.get("plain_language_reason") or "").strip()
+    if len(rationale.split()) > 8 and rationale.upper() not in {"HOLD", "BUY", "SELL"}:
+        deep["plain_language_reason"] = rationale
+        return deep
+
+    side = str(signal.get("side") or quick["signal"]["side"]).upper()
+    rows = quick.get("timeframe_breakdown") or []
+    bullish = sum(row.get("trend") == "Bullish" for row in rows)
+    bearish = sum(row.get("trend") == "Bearish" for row in rows)
+    neutral = len(rows) - bullish - bearish
+    mixed = not rows or (bullish and bearish) or neutral
+    parts = [f"Decision summary: The result is {side} because " +
+             ("bullish and bearish signals are mixed." if mixed else
+              f"the available timeframes have a {'bullish' if bullish else 'bearish'} bias.")]
+    if rows:
+        parts.append(f"Multi-timeframe confirmation: {bullish} timeframes are bullish, "
+                     f"{bearish} are bearish, and {neutral} are neutral, so confirmation "
+                     f"is {'not strong enough for a high-confidence trade' if mixed else 'directionally aligned' }.")
+        rsi_values = [row.get("rsi") for row in rows if row.get("rsi") is not None]
+        macd = {row.get("macd") for row in rows if row.get("macd")}
+        ema_values = [row.get("ema_bias") for row in rows if row.get("ema_bias") is not None]
+        parts.append("Indicators: " +
+                     (f"RSI averages {sum(rsi_values) / len(rsi_values):.1f}; " if rsi_values else "RSI is unavailable; ") +
+                     (f"MACD readings are {', '.join(sorted(macd)).lower()}; " if macd else "MACD is unavailable; ") +
+                     (f"the average EMA bias is {sum(ema_values) / len(ema_values):+.2f}. " if ema_values else "EMA bias is unavailable. ") +
+                     quick.get("volatility_summary", "ATR/risk data is unavailable."))
+    else:
+        parts.append("Multi-timeframe confirmation: Candle timeframes are unavailable, so the decision relies on live-price rules.")
+        parts.append("Indicators: RSI, MACD, EMA bias, and ATR are unavailable for this run; the risk score uses live volatility instead.")
+    price = quick.get("live_price", quick.get("market", {}).get("price"))
+    change = quick.get("change_24h", quick.get("market", {}).get("change_24h"))
+    volume = quick.get("volume", quick.get("market", {}).get("volume"))
+    levels = quick.get("key_levels") or {}
+    parts.append(f"Price context: Live price is {_display(price)}, 24h change is {_display(change, '%')}, "
+                 f"and volume is {_display(volume)}. Support is {_display(levels.get('support'))} and "
+                 f"resistance is {_display(levels.get('resistance'))}.")
+    stop = signal.get("stop_loss", levels.get("stop_loss"))
+    target = signal.get("take_profit", levels.get("take_profit"))
+    size = signal.get("position_size_pct", quick.get("risk", {}).get("position_size_pct"))
+    parts.append(f"Risk guidance: Risk score is {_display(signal.get('risk_score', quick['signal'].get('risk_score')))}, "
+                 f"stop loss is {_display(stop)}, take profit is {_display(target)}, and position size is "
+                 f"{_display(None if size is None else size * 100, '%')}.")
+    meaning = ("HOLD means the app does not see a strong enough setup to open a new trade right now."
+               if side == "HOLD" else f"{side} is a research signal, not an instruction to place a live trade.")
+    parts.append(f"Beginner-friendly meaning: {meaning}")
+    parts.append("What to watch next: A breakout above resistance with improving momentum would support a stronger BUY setup. "
+                 "A breakdown below support would increase SELL risk.")
+    reason = "\n\n".join(parts)
+    signal["rationale"] = reason
+    deep["plain_language_reason"] = reason
+    return deep
+
+
+def _display(value: object, suffix: str = "") -> str:
+    if value is None:
+        return "unavailable"
+    if isinstance(value, (int, float)):
+        return f"{value:,.2f}{suffix}"
+    return f"{value}{suffix}"
