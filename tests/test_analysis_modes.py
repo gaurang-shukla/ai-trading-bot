@@ -123,7 +123,7 @@ def test_deep_frontend_has_progress_timeout_and_preserves_quick_result():
         assert step in javascript
     assert "still running in the background" in javascript
     assert "Check Deep AI status" in javascript
-    assert "signalPanel(data" in javascript and "technicalPanels(data)" in javascript
+    assert "deepInsight(data)" in javascript
     assert 'id="quick-result"' in javascript
 
 
@@ -161,6 +161,40 @@ def test_chart_renders_candles_timeframes_and_collision_safe_labels():
     assert "Math.max(top,Math.min(bottom" in javascript
     assert "chart-label-pill" in javascript
     assert "current_price" in javascript
+
+
+def test_chart_hover_tooltip_contains_ohlcv_and_bounded_positioning():
+    javascript = TestClient(app).get("/assets/app.js").text
+    assert 'class="chart-tooltip"' in javascript
+    assert 'data-hover-enabled="true"' in javascript
+    for field in ("time", "open", "high", "low", "close", "volume"):
+        assert f'data-field="{field}"' in javascript
+    assert "getBoundingClientRect()" in javascript
+    assert "Math.max(gap,Math.min(left,stageBox.width-tip.width-gap))" in javascript
+    assert "Math.max(gap,Math.min(top,stageBox.height-tip.height-gap))" in javascript
+    assert "pointerdown" in javascript
+
+
+def test_timeframe_switching_rebinds_chart_hover():
+    javascript = TestClient(app).get("/assets/app.js").text
+    assert "function bindChartHover" in javascript
+    assert "function bindChartTimeframes(container,data){bindChartHover(container)" in javascript
+    assert "container.innerHTML=priceChart(data,button.dataset.chartFrame);bindChartTimeframes" in javascript
+
+
+def test_deep_completed_and_fallback_views_stay_compact_and_compare_signals():
+    javascript = TestClient(app).get("/assets/app.js").text
+    completed = javascript.split("if(job.status==='completed')", 1)[1].split("return}const fallback", 1)[0]
+    assert "deepInsight(data)" in completed
+    assert "signalPanel(" not in completed
+    assert "technicalPanels(" not in completed
+    assert "chart-mount" not in completed
+    assert "live-price" not in completed
+    assert "Deep AI ${agrees?'agrees with':'differs from'} Quick Signal" in javascript
+    assert "Quick Signal:" in javascript and "Deep AI:" in javascript
+    assert "Reason for difference" in javascript
+    assert "Deep AI fallback used." in javascript
+    assert "The main Quick Signal above remains the source of this result." in javascript
 
 
 def test_quick_api_reuses_ohlcv_for_chart_without_extra_fetch():
