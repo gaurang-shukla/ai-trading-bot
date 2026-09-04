@@ -3,6 +3,7 @@ import json
 from datetime import date
 
 from .adapters import PaperclipReporter, TradingAgentsClient
+from .config import load_project_env
 from .execution import PaperBroker
 from .models import MarketKind, MarketSelection
 from .risk import RiskEngine, RiskLimits
@@ -11,6 +12,7 @@ from .venues import default_registry
 
 
 def main() -> None:
+    load_project_env()
     parser = argparse.ArgumentParser(description="Run one guarded paper-trading decision")
     parser.add_argument("symbol")
     parser.add_argument("--market", choices=[item.value for item in MarketKind],

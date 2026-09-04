@@ -49,7 +49,7 @@ class WeexDemoTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "1x to 5x"):
             WeexDemoFuturesBroker(FakeTransport(), MemoryLedger(), max_leverage=20)
     def test_live_requires_two_flags(self):
-        with patch.dict(os.environ, {"TRADING_MODE": "live"}, clear=True):
+        with patch.dict(os.environ, {"TRADING_MODE": "live", "WEEX_LIVE_ENABLED": "true"}, clear=True):
             self.assertFalse(live_execution_enabled())
 
 if __name__ == "__main__":
