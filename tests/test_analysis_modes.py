@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from tradebot.analysis import DeepAnalysisCache, QuickSignalEngine, normalize_deep_reasoning
+from tradebot.analysis import DeepAnalysisCache, DeepJobRegistry, QuickSignalEngine, normalize_deep_reasoning
 from tradebot.app import app
 from tradebot.models import MarketSnapshot, Side, TradeSignal
 
@@ -11,6 +11,16 @@ from tradebot.models import MarketSnapshot, Side, TradeSignal
 def snapshot():
     return MarketSnapshot("BTCUSDT", 100.0, "2026-09-04T00:00:00Z", "WEEX",
                           4.2, 25_000_000, .0001, 5.0)
+
+
+def wait_for_job(client, job_id, timeout=2):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = client.get(f"/api/analyze/deep/status/{job_id}").json()
+        if result["status"] not in {"queued", "running"}:
+            return result
+        time.sleep(.01)
+    raise AssertionError("job did not reach a terminal state")
 
 
 def test_quick_signal_does_not_call_openai_or_tradingagents():
@@ -69,11 +79,14 @@ def test_deep_timeout_returns_complete_quick_fallback(monkeypatch):
     monkeypatch.delenv("SIGNAL_DEBUG", raising=False)
     with (patch("tradebot.app.default_registry", return_value=registry),
           patch("tradebot.app.signals.analyze", side_effect=slow_signal)):
-        result = TestClient(app).post("/api/analyze/deep", json={"symbol": "BTCUSDT", "refresh": True}).json()
-    assert result["timed_out"] is True
-    assert result["ai_notice"].startswith("Deep AI took too long")
-    assert {"signal", "live_price", "change_24h", "volume", "timeframe_breakdown", "key_levels"} <= result.keys()
-    assert {"confidence", "risk_score", "stop_loss", "take_profit"} <= result["signal"].keys()
+        client = TestClient(app)
+        started = client.post("/api/analyze/deep", json={"symbol": "BTCUSDT", "refresh": True}).json()
+        result = wait_for_job(client, started["job_id"])
+    assert result["status"] == "timed_out"
+    assert result["user_friendly_error"].startswith("Deep AI reached")
+    fallback = result["fallback_result"]
+    assert {"signal", "live_price", "change_24h", "volume", "timeframe_breakdown", "key_levels"} <= fallback.keys()
+    assert {"confidence", "risk_score", "stop_loss", "take_profit"} <= fallback["signal"].keys()
     assert "debug_error" not in result
 
 
@@ -84,7 +97,9 @@ def test_deep_timeout_raw_error_requires_debug(monkeypatch):
     monkeypatch.setenv("SIGNAL_DEBUG", "true")
     with (patch("tradebot.app.default_registry", return_value=registry),
           patch("tradebot.app.signals.analyze", side_effect=lambda *_: time.sleep(.1))):
-        result = TestClient(app).post("/api/analyze/deep", json={"symbol": "BTCUSDT", "refresh": True}).json()
+        client = TestClient(app)
+        started = client.post("/api/analyze/deep", json={"symbol": "ETHUSDT", "refresh": True}).json()
+        result = wait_for_job(client, started["job_id"])
     assert "TimeoutError" in result["debug_error"]
 
 
@@ -106,6 +121,31 @@ def test_deep_frontend_has_progress_timeout_and_preserves_quick_result():
     for step in ("Preparing market data", "Checking technical indicators", "Running TradingAgents research",
                  "Building plain-language summary", "Finalizing decision"):
         assert step in javascript
-    assert "controller.abort()" in javascript
+    assert "still running in the background" in javascript
+    assert "Check Deep AI status" in javascript
     assert "signalPanel(data" in javascript and "technicalPanels(data)" in javascript
     assert 'id="quick-result"' in javascript
+
+
+def test_background_registry_deduplicates_and_caches_completed_job():
+    jobs = DeepJobRegistry(ttl_seconds=600)
+    release = __import__("threading").Event()
+    run = Mock(side_effect=lambda progress: (release.wait(), {"signal": {"side": "BUY"}})[1])
+    first = jobs.start("crypto_futures", "SOLUSDT", run, lambda: {})
+    second = jobs.start("crypto_futures", "solusdt", run, lambda: {}, refresh=True)
+    assert first["job_id"] == second["job_id"]
+    release.set()
+    deadline = time.monotonic() + 1
+    while jobs.get(first["job_id"])["status"] != "completed" and time.monotonic() < deadline:
+        time.sleep(.01)
+    cached = jobs.start("crypto_futures", "SOLUSDT", run, lambda: {})
+    assert cached["job_id"] == first["job_id"]
+    assert cached["cached"] is True
+    assert run.call_count == 1
+
+
+def test_chart_has_payload_and_unavailable_state():
+    javascript = TestClient(app).get("/assets/app.js").text
+    assert "chart_points" in javascript
+    assert "Chart unavailable" in javascript
+    assert "Recent price line chart" in javascript
