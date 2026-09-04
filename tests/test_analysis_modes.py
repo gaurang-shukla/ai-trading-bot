@@ -1,10 +1,12 @@
 import time
+import json
+from io import BytesIO
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from tradebot.analysis import (DeepAnalysisCache, DeepJobRegistry, QuickSignalEngine,
-                               ensure_risk_plan, normalize_deep_reasoning)
+from tradebot.analysis import (DeepAnalysisCache, DeepJobRegistry, FastAIExplainer,
+                               QuickSignalEngine, ensure_risk_plan, normalize_deep_reasoning)
 from tradebot.app import app
 from tradebot.models import Candle, MarketSnapshot, Side, TradeSignal
 
@@ -43,6 +45,53 @@ def test_quick_signal_computation_uses_fast_path():
     assert result["signal"]["stop_loss"] is not None
 
 
+def test_fast_summary_preserves_quick_signal_and_has_stable_contract():
+    provider = Mock(snapshot=Mock(return_value=MarketSnapshot(
+        "FASTTEST", 100, "2026-09-04T00:00:00Z", "test", 4.2, 1_000_000, None, 2)),
+        candles=Mock(return_value=[]))
+    registry = Mock(market_data=Mock(return_value=provider))
+    with (patch("tradebot.app.default_registry", return_value=registry),
+          patch("tradebot.app.fast_ai.explain", return_value="The existing BUY setup is supported by positive momentum and controlled risk.")):
+        response = TestClient(app).post("/api/analyze/summary", json={"symbol": "FASTTEST"})
+    assert response.status_code == 200
+    result = response.json()
+    assert result["main_signal_action"] == "BUY"
+    assert result["ai_mode"] == "fast_explanation"
+    assert result["fallback_used"] is False
+    assert {"confidence", "risk_score", "live_price", "risk_plan", "ai_explanation",
+            "what_to_watch_next"} <= result.keys()
+
+
+def test_fast_summary_timeout_returns_useful_deterministic_fallback(monkeypatch):
+    provider = Mock(snapshot=Mock(return_value=MarketSnapshot(
+        "SLOWFAST", 100, "2026-09-04T00:00:00Z", "test", 0, 1_000_000, None, 2)),
+        candles=Mock(return_value=[]))
+    registry = Mock(market_data=Mock(return_value=provider))
+    monkeypatch.setenv("SIGNAL_FAST_AI_TIMEOUT_SECONDS", "0.01")
+    with (patch("tradebot.app.default_registry", return_value=registry),
+          patch("tradebot.app.fast_ai.explain", side_effect=lambda *_: time.sleep(.1))):
+        result = TestClient(app).post("/api/analyze/summary", json={"symbol": "SLOWFAST"}).json()
+    assert result["fallback_used"] is True
+    assert result["main_signal_action"] == "HOLD"
+    assert "does not create a second signal" in result["ai_explanation"]
+    assert "support" in result["what_to_watch_next"].lower()
+
+
+def test_one_word_fast_ai_output_is_expanded(monkeypatch):
+    class Response(BytesIO):
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    payload = json.dumps({"choices": [{"message": {"content": "Bullish"}}]}).encode()
+    with patch("tradebot.analysis.urlopen", return_value=Response(payload)):
+        text = FastAIExplainer().explain(QuickSignalEngine().analyze(snapshot(), 100_000))
+    assert len(text.split()) > 12
+    assert "Quick Signal is BUY" in text
+
+
 def test_deep_results_are_cached_by_market_and_symbol():
     cache = DeepAnalysisCache(ttl_seconds=600)
     run = Mock(return_value={"ai_available": True, "signal": {"side": "BUY"}})
@@ -59,7 +108,7 @@ def test_deep_ai_failure_does_not_replace_quick_signal_ui():
     client = TestClient(app)
     page = client.get("/").text
     javascript = client.get("/assets/app.js").text
-    assert "Run Deep AI Research" in javascript
+    assert "Run Advanced Deep Research Report" in javascript
     assert "Quick Signal remains available above" in javascript
     assert "id=\"quick-result\"" in javascript
     assert "Signal" in page
@@ -84,7 +133,7 @@ def test_deep_timeout_returns_complete_quick_fallback(monkeypatch):
         started = client.post("/api/analyze/deep", json={"symbol": "BTCUSDT", "refresh": True}).json()
         result = wait_for_job(client, started["job_id"])
     assert result["status"] == "timed_out"
-    assert result["user_friendly_error"].startswith("Deep AI reached")
+    assert result["user_friendly_error"].startswith("Advanced Deep Research reached")
     fallback = result["fallback_result"]
     assert {"signal", "live_price", "change_24h", "volume", "timeframe_breakdown", "key_levels"} <= fallback.keys()
     assert {"confidence", "risk_score", "stop_loss", "take_profit"} <= fallback["signal"].keys()
@@ -160,7 +209,7 @@ def test_deep_frontend_has_progress_timeout_and_preserves_quick_result():
                  "Building plain-language summary", "Finalizing decision"):
         assert step in javascript
     assert "still running in the background" in javascript
-    assert "Check Deep AI status" in javascript
+    assert "Check Advanced Research status" in javascript
     assert "deepInsight(data)" in javascript
     assert 'id="quick-result"' in javascript
 
@@ -265,10 +314,10 @@ def test_deep_completed_and_fallback_views_stay_compact_and_compare_signals():
     assert "technicalPanels(" not in completed
     assert "chart-mount" not in completed
     assert "live-price" not in completed
-    assert "Deep AI ${agrees?'agrees with':'differs from'} Quick Signal" in javascript
-    assert "Quick Signal:" in javascript and "Deep AI:" in javascript
+    assert "Advanced Research ${agrees?'agrees with':'differs from'} Quick Signal" in javascript
+    assert "Quick Signal:" in javascript and "Advanced Research:" in javascript
     assert "Reason for difference" in javascript
-    assert "Deep AI fallback used." in javascript
+    assert "Advanced Research fallback used." in javascript
     assert "The main Quick Signal above remains the source of this result." in javascript
 
 
