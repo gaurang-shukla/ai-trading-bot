@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 from datetime import date, datetime, timezone
@@ -6,6 +7,20 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .models import MarketSnapshot, Side, TradeSignal
+
+
+_CRYPTO_QUOTES = ("USDT", "USDC", "USD")
+
+
+def research_symbol(symbol: str) -> str:
+    """Translate an exchange crypto pair into the format used by research feeds."""
+    value = symbol.upper().replace("/", "").replace(":", "")
+    if "-" in value:
+        return value
+    for quote in _CRYPTO_QUOTES:
+        if value.endswith(quote) and len(value) > len(quote):
+            return f"{value[:-len(quote)]}-USD"
+    return value
 
 
 class MarketData(Protocol):
@@ -29,6 +44,45 @@ class OpenBBClient:
         row = payload["results"][0]
         price = row.get("last_price") or row.get("price") or row.get("close")
         return MarketSnapshot(symbol.upper(), float(price), row.get("last_trade_timestamp", date.today().isoformat()), "openbb")
+
+
+class YahooFinanceClient:
+    """Optional yfinance adapter; importing it lazily keeps Yahoo non-essential."""
+
+    def snapshot(self, symbol: str) -> MarketSnapshot:
+        yfinance = importlib.import_module("yfinance")
+        ticker = yfinance.Ticker(symbol)
+        history = ticker.history(period="2d", interval="1d")
+        if history.empty:
+            raise ValueError(f"Yahoo Finance returned no quote for {symbol}")
+        row = history.iloc[-1]
+        timestamp = getattr(history.index[-1], "isoformat", lambda: date.today().isoformat())()
+        return MarketSnapshot(symbol.upper(), float(row["Close"]), timestamp, "yahoo_finance")
+
+
+class NormalizedMarketData:
+    """Query a research provider with its symbol while retaining the WEEX identity."""
+
+    def __init__(self, provider: MarketData):
+        self.provider = provider
+
+    def snapshot(self, symbol: str) -> MarketSnapshot:
+        result = self.provider.snapshot(research_symbol(symbol))
+        return MarketSnapshot(symbol.upper(), result.price, result.as_of, result.source)
+
+
+class FallbackMarketData:
+    def __init__(self, *providers: MarketData):
+        self.providers = providers
+
+    def snapshot(self, symbol: str) -> MarketSnapshot:
+        errors = []
+        for provider in self.providers:
+            try:
+                return provider.snapshot(symbol)
+            except Exception as exc:
+                errors.append(f"{type(provider).__name__}: {exc}")
+        raise RuntimeError("; ".join(errors) or "no market data providers configured")
 
 
 class _WeexPublicClient:
@@ -84,16 +138,41 @@ class TradingAgentsClient:
         self.config = config
 
     def analyze(self, symbol: str, as_of: str) -> TradeSignal:
-        from tradingagents.default_config import DEFAULT_CONFIG
-        from tradingagents.graph.trading_graph import TradingAgentsGraph
+        try:
+            graph_class = _import_attribute((
+                ("tradingagents.graph.trading_graph", "TradingAgentsGraph"),
+                ("tradingagents.graph", "TradingAgentsGraph"),
+                ("tradingagents", "TradingAgentsGraph"),
+            ))
+            config = self.config
+            if config is None:
+                default = _import_attribute((
+                    ("tradingagents.default_config", "DEFAULT_CONFIG"),
+                    ("tradingagents.config", "DEFAULT_CONFIG"),
+                    ("tradingagents.config.default_config", "DEFAULT_CONFIG"),
+                    ("tradingagents", "DEFAULT_CONFIG"),
+                ))
+                config = default.copy()
+            graph = graph_class(debug=False, config=config)
+            _, decision = graph.propagate(research_symbol(symbol), as_of)
+            raw = str(decision).upper()
+            side = Side.BUY if "BUY" in raw else Side.SELL if "SELL" in raw else Side.HOLD
+            confidence = 0.75 if side is not Side.HOLD else 0.0
+            return TradeSignal(symbol.upper(), side, confidence, str(decision), "TradingAgents")
+        except Exception as exc:
+            return TradeSignal(symbol.upper(), Side.HOLD, 0.0,
+                               f"Analysis unavailable: {type(exc).__name__}: {exc}",
+                               "safe_fallback")
 
-        graph = TradingAgentsGraph(debug=False, config=self.config or DEFAULT_CONFIG.copy())
-        _, decision = graph.propagate(symbol, as_of)
-        raw = str(decision).upper()
-        side = Side.BUY if "BUY" in raw else Side.SELL if "SELL" in raw else Side.HOLD
-        # Upstream currently returns a decision, not a calibrated probability.
-        confidence = 0.75 if side is not Side.HOLD else 0.0
-        return TradeSignal(symbol.upper(), side, confidence, str(decision), "TradingAgents")
+
+def _import_attribute(candidates: tuple[tuple[str, str], ...]):
+    errors = []
+    for module_name, attribute in candidates:
+        try:
+            return getattr(importlib.import_module(module_name), attribute)
+        except (ImportError, AttributeError) as exc:
+            errors.append(f"{module_name}.{attribute}: {exc}")
+    raise ImportError("No compatible TradingAgents package layout found (" + "; ".join(errors) + ")")
 
 
 class PaperclipReporter:

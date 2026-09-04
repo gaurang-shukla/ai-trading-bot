@@ -1,6 +1,8 @@
 from collections.abc import Callable
 
-from .adapters import MarketData, OpenBBClient, WeexFuturesMarketData, WeexSpotMarketData
+from .adapters import (FallbackMarketData, MarketData, NormalizedMarketData,
+                       OpenBBClient, WeexFuturesMarketData, WeexSpotMarketData,
+                       YahooFinanceClient)
 from .models import MarketKind, MarketSelection
 
 
@@ -27,8 +29,11 @@ class VenueRegistry:
 
 def default_registry() -> VenueRegistry:
     registry = VenueRegistry()
-    registry.register(MarketKind.CRYPTO_SPOT, "weex", WeexSpotMarketData)
-    registry.register(MarketKind.CRYPTO_FUTURES, "weex", WeexFuturesMarketData)
+    research_fallbacks = lambda primary: FallbackMarketData(
+        primary(), NormalizedMarketData(YahooFinanceClient()),
+        NormalizedMarketData(OpenBBClient()))
+    registry.register(MarketKind.CRYPTO_SPOT, "weex", lambda: research_fallbacks(WeexSpotMarketData))
+    registry.register(MarketKind.CRYPTO_FUTURES, "weex", lambda: research_fallbacks(WeexFuturesMarketData))
     # OpenBB is the normalized research/data route for non-crypto markets.
     for market in (MarketKind.EQUITIES, MarketKind.FOREX, MarketKind.COMMODITIES, MarketKind.OPTIONS):
         registry.register(market, "openbb", OpenBBClient)

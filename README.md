@@ -45,8 +45,11 @@ adapter to `http://127.0.0.1:8787/api/paperclip/analyze` and give it the header
 standard Paperclip run envelope and reads optional `symbol`, `market`, `venue`, and
 `equity` values from `context`; otherwise it uses the safe defaults in `.env`.
 
-If a required upstream is missing or misconfigured, the app returns a visible setup
-error. It does not manufacture a fallback signal.
+If an upstream is missing, incompatible, or temporarily unavailable, analysis degrades
+to a visible, non-executable HOLD result instead of crashing the Analyse page. Crypto
+quotes try WEEX first, then optional Yahoo Finance and OpenBB research feeds; research
+providers receive normalized symbols such as `BTC-USD`, while exchange and risk records
+continue to use `BTCUSDT`.
 
 | Layer | Upstream | Responsibility |
 |---|---|---|
@@ -96,7 +99,9 @@ tradebot BTCUSDT --market crypto_futures --venue weex --date 2026-09-01 --equity
 ```
 
 OpenBB must be reachable at `OPENBB_API_URL` (default `http://127.0.0.1:6900`).
-TradingAgents requires an enabled LLM provider key. Paperclip reporting is disabled
+TradingAgents package layouts are detected at runtime and failures (including its LLM
+provider) become safe HOLD results. TradingAgents requires an enabled LLM provider key
+for full analysis. Paperclip reporting is disabled
 unless `PAPERCLIP_TASK_BRIDGE_URL` and its scoped key are explicitly configured.
 
 ## Safety gates before any live broker
