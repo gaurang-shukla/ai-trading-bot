@@ -117,14 +117,6 @@ def create_app() -> FastAPI:
             raise HTTPException(502, f"Market overview could not load: {exc}") from exc
 
     def run_analysis(request: AnalyzeRequest):
-        status = integration_status()
-        if not status["tradingagents"]["installed"]:
-            raise HTTPException(503, "TradingAgents is not installed. Run the upstream installer first.")
-        if not status["tradingagents"]["configured"]:
-            raise HTTPException(503, "Add one supported LLM provider key to .env, then restart Signal.")
-        if request.venue.lower() == "openbb" and not status["openbb"]["configured"]:
-            raise HTTPException(503, "Start OpenBB and set OPENBB_API_URL in .env.")
-
         try:
             selection = MarketSelection(request.market, request.venue, request.symbol.upper())
             data = default_registry().market_data(selection)
