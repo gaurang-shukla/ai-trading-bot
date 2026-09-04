@@ -46,7 +46,7 @@ class OpenBBClient:
 
     def snapshot(self, symbol: str) -> MarketSnapshot:
         url = f"{self.base_url}/api/v1/{self.asset_class}/price/quote?{urlencode({'symbol': symbol})}"
-        with urlopen(url, timeout=20) as response:
+        with urlopen(url, timeout=float(os.getenv("MARKET_DATA_TIMEOUT_SECONDS", "0.9"))) as response:
             payload = json.load(response)
         results = payload if isinstance(payload, list) else payload.get("results", payload.get("data", []))
         row = results[0] if isinstance(results, list) else results
@@ -89,7 +89,7 @@ class YahooFinanceClient:
         url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
                f"{quote(symbol, safe='')}?interval=1d&range=5d")
         request = Request(url, headers={"User-Agent": "Mozilla/5.0 Signal/0.5"})
-        with urlopen(request, timeout=10) as response:
+        with urlopen(request, timeout=float(os.getenv("MARKET_DATA_TIMEOUT_SECONDS", "0.9"))) as response:
             payload = json.load(response)
         result = payload.get("chart", {}).get("result") or []
         if not result:
@@ -119,7 +119,8 @@ class NormalizedMarketData:
     def snapshot(self, symbol: str) -> MarketSnapshot:
         result = self.provider.snapshot(research_symbol(symbol))
         return MarketSnapshot(symbol.upper(), result.price, result.as_of, result.source,
-                              result.change_24h, result.volume)
+                              result.change_24h, result.volume, result.funding_rate,
+                              result.volatility_24h)
 
 
 class FallbackMarketData:
@@ -151,7 +152,7 @@ class _WeexPublicClient:
     def _get(self, path: str, params: dict[str, str]) -> dict | list:
         url = f"{self.base_url}{path}?{urlencode(params)}"
         request = Request(url, headers={"User-Agent": "three-layer-tradebot/0.2"})
-        with urlopen(request, timeout=10) as response:
+        with urlopen(request, timeout=float(os.getenv("MARKET_DATA_TIMEOUT_SECONDS", "0.9"))) as response:
             return json.load(response)
 
     @staticmethod
@@ -168,7 +169,10 @@ class WeexSpotMarketData(_WeexPublicClient):
         payload = self._get("/api/v3/market/ticker/24hr", {"symbol": symbol.upper()})
         row = payload[0] if isinstance(payload, list) else payload
         return MarketSnapshot(symbol.upper(), float(row["lastPrice"]),
-                              self._timestamp(row.get("closeTime")), "weex_spot_v3")
+                              self._timestamp(row.get("closeTime")), "weex_spot_v3",
+                              _optional_float(row.get("priceChangePercent") or row.get("changeRate")),
+                              _optional_float(row.get("quoteVolume") or row.get("volume")), None,
+                              _ticker_volatility(row))
 
     def tickers(self) -> list[dict]:
         payload = self._get("/api/v3/market/ticker/24hr", {})
@@ -179,10 +183,15 @@ class WeexFuturesMarketData(_WeexPublicClient):
     base_url = "https://api-contract.weex.com"
 
     def snapshot(self, symbol: str) -> MarketSnapshot:
-        row = self._get("/capi/v3/market/symbolPrice",
-                        {"symbol": symbol.upper(), "priceType": "MARK"})
-        return MarketSnapshot(symbol.upper(), float(row["price"]),
-                              self._timestamp(row.get("time")), "weex_futures_v3_mark")
+        payload = self._get("/capi/v3/market/ticker/24hr", {"symbol": symbol.upper()})
+        row = payload[0] if isinstance(payload, list) else payload
+        price = row.get("lastPrice") or row.get("last") or row.get("markPrice") or row.get("price")
+        return MarketSnapshot(symbol.upper(), float(price),
+                              self._timestamp(row.get("closeTime") or row.get("time")), "weex_futures_v3",
+                              _optional_float(row.get("priceChangePercent") or row.get("changeRate")),
+                              _optional_float(row.get("quoteVolume") or row.get("volume")),
+                              _optional_float(row.get("fundingRate") or row.get("lastFundingRate")),
+                              _ticker_volatility(row))
 
     def supported_symbols(self) -> list[str]:
         payload = self._get("/capi/v3/market/apiTradingSymbols", {})
@@ -357,6 +366,13 @@ def _optional_float(value) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _ticker_volatility(row: dict) -> float | None:
+    high = _optional_float(row.get("highPrice") or row.get("high_24h"))
+    low = _optional_float(row.get("lowPrice") or row.get("low_24h"))
+    price = _optional_float(row.get("lastPrice") or row.get("last") or row.get("price"))
+    return (high - low) / price * 100 if high is not None and low is not None and price else None
 
 
 def _import_attribute(candidates: tuple[tuple[str, str], ...]):

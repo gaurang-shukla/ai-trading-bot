@@ -118,7 +118,8 @@ class MarketOverviewService:
             try:
                 snapshot = provider.snapshot(provider_symbol)
                 normalized = MarketSnapshot(symbol, snapshot.price, snapshot.as_of, snapshot.source,
-                                            snapshot.change_24h, snapshot.volume)
+                                            snapshot.change_24h, snapshot.volume,
+                                            snapshot.funding_rate, snapshot.volatility_24h)
                 fallback = normalized
                 # Incomplete primary quotes are not enough for a populated dashboard.
                 if normalized.change_24h is None and index < len(providers) - 1:

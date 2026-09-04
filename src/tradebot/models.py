@@ -37,6 +37,8 @@ class MarketSnapshot:
     source: str
     change_24h: float | None = None
     volume: float | None = None
+    funding_rate: float | None = None
+    volatility_24h: float | None = None
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .adapters import CachedSignalProvider, OpenBBClient, PaperclipReporter, TradingAgentsClient
+from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
+from .analysis import DeepAnalysisCache, QuickSignalEngine
 from .diagnostics import diagnostics
 from .config import load_project_env
 from .execution import PaperBroker
@@ -30,7 +31,9 @@ WEB_DIR = Path(__file__).with_name("web")
 
 
 load_project_env()
-signals = CachedSignalProvider(TradingAgentsClient())
+signals = TradingAgentsClient()
+quick_signals = QuickSignalEngine()
+deep_cache = DeepAnalysisCache()
 
 
 class AnalyzeRequest(BaseModel):
@@ -39,6 +42,10 @@ class AnalyzeRequest(BaseModel):
     venue: str = Field(default="weex", min_length=1, max_length=32)
     as_of: str = Field(default_factory=lambda: date.today().isoformat())
     equity: float = Field(default=100_000, gt=0, le=100_000_000)
+
+
+class DeepAnalyzeRequest(AnalyzeRequest):
+    refresh: bool = False
 
 
 class PaperclipRunRequest(BaseModel):
@@ -198,12 +205,14 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(502, f"Market overview could not load: {exc}") from exc
 
-    def run_analysis(request: AnalyzeRequest):
+    def market_data(request: AnalyzeRequest):
+        selection = MarketSelection(request.market, request.venue, request.symbol.upper())
+        return default_registry().market_data(selection)
+
+    def run_deep_analysis(request: AnalyzeRequest):
         try:
-            selection = MarketSelection(request.market, request.venue, request.symbol.upper())
-            data = default_registry().market_data(selection)
             service = TradingService(
-                data,
+                market_data(request),
                 signals,
                 RiskEngine(RiskLimits()),
                 PaperBroker(request.equity),
@@ -220,7 +229,24 @@ def create_app() -> FastAPI:
 
     @app.post("/api/analyze")
     def analyze(request: AnalyzeRequest):
-        return run_analysis(request)
+        """Backward-compatible fast endpoint; deep research is explicitly opt-in."""
+        return quick_analyze(request)
+
+    @app.post("/api/analyze/quick")
+    def quick_analyze(request: AnalyzeRequest):
+        try:
+            snapshot = market_data(request).snapshot(request.symbol.upper())
+            result = quick_signals.analyze(snapshot, request.equity)
+            result["notice"] = "Deterministic quick signal only. No AI or live order was used."
+            return result
+        except Exception as exc:
+            raise HTTPException(502, f"Live quick signal could not load: {type(exc).__name__}: {exc}") from exc
+
+    @app.post("/api/analyze/deep")
+    def deep_analyze(request: DeepAnalyzeRequest):
+        return deep_cache.get_or_run(
+            request.market.value, request.symbol,
+            lambda: run_deep_analysis(request), refresh=request.refresh)
 
     @app.post("/api/paperclip/analyze")
     def paperclip_analyze(payload: PaperclipRunRequest, authorization: str = Header(default="")):
@@ -235,7 +261,7 @@ def create_app() -> FastAPI:
             venue=str(context.get("venue") or os.getenv("DEFAULT_VENUE", "weex")),
             equity=float(context.get("equity") or os.getenv("PAPER_STARTING_CASH", "100000")),
         )
-        return {"paperclip_run_id": payload.runId, "result": run_analysis(request)}
+        return {"paperclip_run_id": payload.runId, "result": run_deep_analysis(request)}
 
     @app.get("/{path:path}")
     def app_route(path: str):
