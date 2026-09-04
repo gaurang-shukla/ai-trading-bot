@@ -3,7 +3,8 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from tradebot.analysis import DeepAnalysisCache, DeepJobRegistry, QuickSignalEngine, normalize_deep_reasoning
+from tradebot.analysis import (DeepAnalysisCache, DeepJobRegistry, QuickSignalEngine,
+                               ensure_risk_plan, normalize_deep_reasoning)
 from tradebot.app import app
 from tradebot.models import Candle, MarketSnapshot, Side, TradeSignal
 
@@ -114,6 +115,43 @@ def test_hold_reasoning_is_expanded_from_quick_signal():
                     "Risk guidance:", "Beginner-friendly meaning:", "What to watch next:"):
         assert section in reason
     assert reason != "Hold"
+
+
+def test_risk_plan_is_complete_for_buy_sell_and_hold():
+    for change, expected in ((4.2, "BUY"), (-4.2, "SELL")):
+        market = MarketSnapshot("TESTUSDT", 100, "2026-09-04T00:00:00Z", "test",
+                                change, 1_000_000, None, 2)
+        result = QuickSignalEngine().analyze(market, 100_000)
+        assert result["risk_plan"]["action"] == expected
+        assert result["risk_plan"]["has_active_trade_setup"] is True
+        assert result["risk_plan"]["stop_loss"] is not None
+        assert result["risk_plan"]["take_profit"] is not None
+
+    hold = QuickSignalEngine().analyze(MarketSnapshot(
+        "SOLUSDT", 100, "2026-09-04T00:00:00Z", "test", 0, 1_000_000, None, 2), 100_000)
+    assert hold["risk_plan"]["has_active_trade_setup"] is False
+    assert hold["risk_plan"]["stop_loss"] is None
+    assert hold["risk_plan"]["take_profit"] is None
+    assert hold["risk_plan"]["position_size_pct"] == 0
+    assert "does not see a strong enough setup" in hold["risk_plan"]["explanation"]
+
+
+def test_hold_risk_plan_uses_support_and_resistance_as_watch_levels():
+    result = {"signal": {"side": "HOLD", "risk_score": .4},
+              "market": {"price": 100},
+              "key_levels": {"support": 95, "resistance": 105,
+                             "stop_loss": None, "take_profit": None}}
+    ensure_risk_plan(result)
+    assert result["risk_plan"]["breakout_level"] == 105
+    assert result["risk_plan"]["breakdown_level"] == 95
+
+
+def test_hold_ui_explains_empty_trade_levels_and_chart_omits_them():
+    javascript = TestClient(app).get("/assets/app.js").text
+    for copy in ("No active trade setup", "Not applicable for HOLD", "Watch above", "Watch below"):
+        assert copy in javascript
+    assert "active?(plan.stop_loss??data.key_levels?.stop_loss):null" in javascript
+    assert "active?(plan.take_profit??data.key_levels?.take_profit):null" in javascript
 
 
 def test_deep_frontend_has_progress_timeout_and_preserves_quick_result():
