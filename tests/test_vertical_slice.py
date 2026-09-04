@@ -4,7 +4,7 @@ from tradebot.models import MarketKind, MarketSelection
 from tradebot.risk import RiskEngine, RiskLimits
 from tradebot.service import TradingService
 from tradebot.venues import default_registry
-from tradebot.adapters import (FallbackMarketData, NormalizedMarketData,
+from tradebot.adapters import (CachedSignalProvider, FallbackMarketData, NormalizedMarketData,
                                TradingAgentsClient, _import_attribute,
                                research_symbol)
 
@@ -85,6 +85,27 @@ def test_signal_failure_becomes_a_safe_hold(monkeypatch):
     assert signal.side is Side.HOLD
     assert signal.symbol == "BTCUSDT"
     assert signal.model == "safe_fallback"
+    assert signal.rationale == "AI temporarily unavailable. Showing live market data only."
+
+
+def test_analysis_cache_reuses_result_within_ttl():
+    provider = FakeSignals()
+    provider.calls = 0
+    original = provider.analyze
+    provider.analyze = lambda *args: (setattr(provider, "calls", provider.calls + 1) or original(*args))
+    cached = CachedSignalProvider(provider, ttl_seconds=600)
+    assert cached.analyze("AAPL", "2026-09-01") is cached.analyze("aapl", "2026-09-01")
+    assert provider.calls == 1
+
+
+def test_analysis_cache_expires(monkeypatch):
+    provider = FakeSignals()
+    cached = CachedSignalProvider(provider, ttl_seconds=5)
+    clock = iter((10.0, 20.0))
+    monkeypatch.setattr("tradebot.adapters.time.monotonic", lambda: next(clock))
+    first = cached.analyze("AAPL", "2026-09-01")
+    second = cached.analyze("AAPL", "2026-09-01")
+    assert first is not second
 
 
 def test_compatible_import_skips_missing_package_layouts(monkeypatch):
@@ -114,6 +135,15 @@ def test_market_data_failure_does_not_crash_analysis():
     assert result["market"]["source"] == "unavailable"
     assert result["risk"]["approved"] is False
     assert result["warnings"]
+
+
+def test_openai_failure_keeps_live_market_data_visible():
+    class BrokenSignals:
+        def analyze(self, symbol, as_of):
+            raise RuntimeError("429 Rate limit exceeded")
+    result = make_service(BrokenSignals()).run("AAPL", "2026-09-01", 100_000)
+    assert result["market"]["price"] == 100
+    assert result["signal"]["side"] is Side.HOLD
 
 
 def test_non_crypto_markets_are_exposed_through_openbb():

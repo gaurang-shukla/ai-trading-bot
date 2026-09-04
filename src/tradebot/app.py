@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .adapters import PaperclipReporter, TradingAgentsClient
+from .adapters import CachedSignalProvider, PaperclipReporter, TradingAgentsClient
 from .config import load_project_env
 from .execution import PaperBroker
 from .models import MarketKind, MarketSelection
@@ -25,6 +25,7 @@ WEB_DIR = Path(__file__).with_name("web")
 
 
 load_project_env()
+signals = CachedSignalProvider(TradingAgentsClient())
 
 
 class AnalyzeRequest(BaseModel):
@@ -122,7 +123,7 @@ def create_app() -> FastAPI:
             data = default_registry().market_data(selection)
             service = TradingService(
                 data,
-                TradingAgentsClient(),
+                signals,
                 RiskEngine(RiskLimits()),
                 PaperBroker(request.equity),
                 PaperclipReporter(),

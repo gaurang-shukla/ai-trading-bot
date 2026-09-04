@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from tradebot.adapters import PaperclipReporter
 from tradebot.app import app, integration_status
 from tradebot.config import load_project_env
 from tradebot.weex import WeexCredentials
@@ -78,6 +79,16 @@ def test_paperclip_task_bridge_requires_url_and_key():
         assert integration_status()["paperclip"]["ready"] is True
 
 
+def test_missing_paperclip_is_a_noop(monkeypatch):
+    monkeypatch.delenv("PAPERCLIP_TASK_BRIDGE_URL", raising=False)
+    monkeypatch.delenv("PAPERCLIP_API_KEY", raising=False)
+    monkeypatch.setattr("tradebot.adapters.urlopen", lambda *args, **kwargs:
+                        (_ for _ in ()).throw(AssertionError("network must not be called")))
+    reporter = PaperclipReporter()
+    assert reporter.configured is False
+    assert reporter.report({"event": "analysis"}) is None
+
+
 def test_tradingagents_states_remain_independent():
     with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
             patch.object(importlib.util, "find_spec", return_value=None):
@@ -104,8 +115,16 @@ def test_paperclip_bridge_fails_closed_without_token():
 
 
 def test_non_crypto_overview_exposes_real_universe_without_fake_quotes():
-    response = client.get("/api/overview/equities")
+    populated = {
+        "market": "equities", "source": "OpenBB", "fear_greed": {"score": 55},
+        "summary": {"assets": 1, "advancers_pct": 100, "total_quote_volume": 10},
+        "gainers": [], "losers": [],
+        "assets": [{"symbol": "AAPL", "price": 100, "change": 1,
+                    "volume": 10, "signal_score": 70}],
+    }
+    with patch("tradebot.app.market_overview", return_value=populated):
+        response = client.get("/api/overview/equities")
     assert response.status_code == 200
     body = response.json()
-    assert body["source"].startswith("OpenBB")
-    assert body["assets"][0]["price"] is None
+    assert body["source"] == "OpenBB"
+    assert body["assets"][0]["price"] == 100
