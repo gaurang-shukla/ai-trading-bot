@@ -17,6 +17,65 @@ from .models import Candle, MarketSnapshot, Side, TradeSignal
 
 TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
 
+HOLD_EXPLANATION = (
+    "HOLD means the app does not see a strong enough setup to open a new trade right now. "
+    "Because this is HOLD, the app is not suggesting a new entry. Watch resistance for a "
+    "possible bullish breakout and support for possible downside risk."
+)
+
+
+def ensure_risk_plan(result: dict) -> dict:
+    """Attach one stable, explicit risk-plan contract to any analysis result."""
+    signal = result.setdefault("signal", {})
+    levels = result.get("key_levels") or {}
+    side = str(getattr(signal.get("side"), "value", signal.get("side") or "HOLD")).upper()
+    active = side in {"BUY", "SELL", "STRONG BUY", "STRONG SELL"}
+    risk = result.get("risk") or {}
+    quick_signal = (result.get("quick_signal") or {}).get("signal") or {}
+    position_size = signal.get("position_size_pct")
+    if position_size is None:
+        position_size = risk.get("position_size_pct", quick_signal.get("position_size_pct"))
+    risk_score = signal.get("risk_score")
+    if risk_score is None:
+        risk_score = risk.get("score", quick_signal.get("risk_score", 1.0))
+    stop = signal.get("stop_loss") if active else None
+    target = signal.get("take_profit") if active else None
+    if active:
+        stop = stop if stop is not None else levels.get("stop_loss")
+        target = target if target is not None else levels.get("take_profit")
+
+    # Provider/AI signals occasionally omit execution levels. An active setup must
+    # still have a usable plan, so use nearby technical levels and a conservative
+    # one-to-two fallback around the current price.
+    price = result.get("live_price", (result.get("market") or {}).get("price"))
+    bearish = "SELL" in side
+    if active and price is not None:
+        distance = max(abs(float(price)) * .01, 1e-8)
+        if stop is None:
+            candidate = levels.get("resistance" if bearish else "support")
+            stop = candidate if candidate is not None and ((candidate > price) if bearish else (candidate < price)) else price + distance if bearish else price - distance
+        if target is None:
+            candidate = levels.get("support" if bearish else "resistance")
+            target = candidate if candidate is not None and ((candidate < price) if bearish else (candidate > price)) else price - distance * 2 if bearish else price + distance * 2
+
+    signal.update({"stop_loss": stop, "take_profit": target,
+                   "position_size_pct": 0.0 if not active else (position_size or 0.0),
+                   "risk_score": risk_score})
+    explanation = (HOLD_EXPLANATION if not active else
+                   "Stop loss is placed above the invalidation area. Take profit is placed near the next downside target."
+                   if bearish else
+                   "Stop loss is placed below the invalidation area. Take profit is placed near the next upside target.")
+    result["risk_plan"] = {
+        "action": side, "has_active_trade_setup": active,
+        "stop_loss": stop, "take_profit": target,
+        "position_size_pct": signal["position_size_pct"], "risk_score": risk_score,
+        "invalidation_level": stop if active else None,
+        "breakout_level": levels.get("resistance"),
+        "breakdown_level": levels.get("support"),
+        "explanation": explanation,
+    }
+    return result
+
 
 class CandleCache:
     """Short-lived, thread-safe candle cache; failed requests are not cached."""
@@ -112,7 +171,7 @@ class QuickSignalEngine:
         )
         signal = TradeSignal(market.symbol, side, confidence, rationale, "quick_rules_v1",
                              risk_score, stop, target, probability, position_pct)
-        return {
+        return ensure_risk_plan({
             "mode": "quick", "market": asdict(market), "signal": asdict(signal),
             "risk": {"score": risk_score, "position_size_pct": position_pct,
                      "position_notional": equity * position_pct},
@@ -121,8 +180,8 @@ class QuickSignalEngine:
             "volatility_summary": "Risk uses reported or estimated 24-hour volatility.",
             "key_levels": {"support": None, "resistance": None, "stop_loss": stop,
                            "take_profit": target}, "timeframe_breakdown": [],
-            "plain_language_reason": rationale, "fallback": True,
-        }
+            "plain_language_reason": f"{rationale} {HOLD_EXPLANATION}" if side is Side.HOLD else f"{rationale} " + ("Stop loss is placed above the invalidation area. Take profit is placed near the next downside target." if bearish else "Stop loss is placed below the invalidation area. Take profit is placed near the next upside target."), "fallback": True,
+        })
 
     def _technical_analysis(self, market: MarketSnapshot, equity: float,
                             frames: dict[str, list[Candle]]) -> dict:
@@ -183,11 +242,16 @@ class QuickSignalEngine:
         trend = f"{sum(row['trend'] == 'Bullish' for row in breakdown)} bullish, {sum(row['trend'] == 'Bearish' for row in breakdown)} bearish timeframes."
         momentum = "RSI and MACD confirmation are mixed." if abs(score) < 2 else f"Momentum confirms a {'bullish' if score > 0 else 'bearish'} bias."
         volatility = f"Average ATR is {volatility_pct:.2f}% of price; risk is {'elevated' if risk_score > .65 else 'controlled'}."
+        risk_reason = (HOLD_EXPLANATION if side is Side.HOLD else
+                       "Stop loss is placed above the invalidation area. Take profit is placed near the next downside target."
+                       if bearish else
+                       "Stop loss is placed below the invalidation area. Take profit is placed near the next upside target.")
         reason = (f"The {side.value} result combines {len(breakdown)} available timeframes. {trend} "
-                  f"{momentum} {volatility} Funding is included when available. No AI model was called.")
+                  f"{momentum} {volatility} Funding is included when available. No AI model was called. "
+                  f"{risk_reason}")
         signal = TradeSignal(market.symbol, side, confidence, reason, "multi_timeframe_ta_v1",
                              risk_score, stop, target, probability, position_pct)
-        return {"mode": "quick", "market": asdict(market), "signal": asdict(signal),
+        return ensure_risk_plan({"mode": "quick", "market": asdict(market), "signal": asdict(signal),
                 "risk": {"score": risk_score, "position_size_pct": position_pct,
                          "position_notional": equity * position_pct},
                 "trend_summary": trend, "momentum_summary": momentum,
@@ -195,7 +259,7 @@ class QuickSignalEngine:
                 "key_levels": {"support": support, "resistance": resistance,
                                "stop_loss": stop, "take_profit": target},
                 "timeframe_breakdown": breakdown, "plain_language_reason": reason,
-                "fallback": False}
+                "fallback": False})
 
 
 class DeepAnalysisCache:
@@ -341,9 +405,14 @@ def _signal_debug_enabled() -> bool:
 def normalize_deep_reasoning(deep: dict, quick: dict) -> dict:
     """Keep good agent prose, but expand terse decisions using deterministic evidence."""
     signal = deep.setdefault("signal", {})
+    ensure_risk_plan(deep)
     rationale = str(signal.get("rationale") or deep.get("plain_language_reason") or "").strip()
     if len(rationale.split()) >= 40 and rationale.upper() not in {"HOLD", "BUY", "SELL"}:
         deep["plain_language_reason"] = rationale
+        if deep["risk_plan"]["explanation"] not in rationale:
+            rationale = f"{rationale}\n\nRisk plan: {deep['risk_plan']['explanation']}"
+            signal["rationale"] = rationale
+            deep["plain_language_reason"] = rationale
         return deep
 
     side = str(signal.get("side") or quick["signal"]["side"]).upper()
@@ -383,7 +452,7 @@ def normalize_deep_reasoning(deep: dict, quick: dict) -> dict:
     parts.append(f"Risk guidance: Risk score is {_display(signal.get('risk_score', quick['signal'].get('risk_score')))}, "
                  f"stop loss is {_display(stop)}, take profit is {_display(target)}, and position size is "
                  f"{_display(None if size is None else size * 100, '%')}.")
-    meaning = ("HOLD means the app does not see a strong enough setup to open a new trade right now."
+    meaning = (HOLD_EXPLANATION
                if side == "HOLD" else f"{side} is a research signal, not an instruction to place a live trade.")
     parts.append(f"Beginner-friendly meaning: {meaning}")
     parts.append("What to watch next: A breakout above resistance with improving momentum would support a stronger BUY setup. "
@@ -391,7 +460,7 @@ def normalize_deep_reasoning(deep: dict, quick: dict) -> dict:
     reason = "\n\n".join(parts)
     signal["rationale"] = reason
     deep["plain_language_reason"] = reason
-    return deep
+    return ensure_risk_plan(deep)
 
 
 def _display(value: object, suffix: str = "") -> str:
