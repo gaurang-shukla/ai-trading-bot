@@ -1,10 +1,82 @@
 """Real-data-only Bank Nifty option-chain normalization and scoring."""
 
 from dataclasses import asdict
+import json
+import logging
+import os
+import time
+from http.cookiejar import CookieJar
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from .models import OptionContract
 
 UNAVAILABLE_MESSAGE = "Bank Nifty options data provider not configured yet."
+logger = logging.getLogger(__name__)
+
+
+class NSEOptionChainClient:
+    """Small, dependency-free client for NSE's public BANKNIFTY chain endpoint."""
+
+    BASE_URL = "https://www.nseindia.com"
+    HEADERS = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/option-chain",
+        "Connection": "keep-alive",
+    }
+
+    def __init__(self, timeout: float | None = None, retries: int = 2):
+        self.timeout = timeout if timeout is not None else float(
+            os.getenv("NSE_TIMEOUT_SECONDS", "8"))
+        self.retries = max(0, retries)
+
+    def option_chain(self, expiry: str | None = None) -> dict:
+        opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        # NSE commonly requires cookies from its landing page before API access.
+        self._open_json(opener, f"{self.BASE_URL}/option-chain", expect_json=False)
+        url = f"{self.BASE_URL}/api/option-chain-indices?{urlencode({'symbol': 'BANKNIFTY'})}"
+        payload = self._open_json(opener, url)
+        records = payload.get("records") or {}
+        rows, requested = [], expiry or ""
+        for item in records.get("data") or []:
+            row_expiry = str(item.get("expiryDate") or "")
+            if requested and row_expiry != requested:
+                continue
+            for option_type in ("CE", "PE"):
+                leg = item.get(option_type)
+                if not isinstance(leg, dict):
+                    continue
+                rows.append({
+                    "expiry": row_expiry, "strike": item.get("strikePrice"),
+                    "option_type": option_type, "last_price": leg.get("lastPrice"),
+                    "change": leg.get("change"), "volume": leg.get("totalTradedVolume"),
+                    "open_interest": leg.get("openInterest"),
+                    "implied_volatility": leg.get("impliedVolatility"),
+                    "bid": leg.get("bidprice"), "ask": leg.get("askPrice"),
+                })
+        spot = records.get("underlyingValue")
+        if spot is None:
+            spot = next((leg.get("underlyingValue") for item in records.get("data") or []
+                         for leg in (item.get("CE"), item.get("PE"))
+                         if isinstance(leg, dict) and leg.get("underlyingValue") is not None), None)
+        return {"symbol": "BANKNIFTY", "source": "NSE fallback", "contracts": rows,
+                "expiries": records.get("expiryDates") or [], "underlying_price": _float(spot)}
+
+    def _open_json(self, opener, url: str, expect_json: bool = True):
+        for attempt in range(self.retries + 1):
+            try:
+                with opener.open(Request(url, headers=self.HEADERS), timeout=self.timeout) as response:
+                    body = response.read()
+                return json.loads(body) if expect_json else {}
+            except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                retryable = not isinstance(exc, HTTPError) or exc.code in {429, 500, 502, 503, 504}
+                if attempt >= self.retries or not retryable:
+                    raise RuntimeError(f"NSE option chain unavailable: {type(exc).__name__}") from exc
+                time.sleep(0.2 * (attempt + 1))
 
 
 def atm_strike(strikes: list[float], spot: float) -> float | None:
@@ -76,7 +148,7 @@ def build_chain(raw: dict, spot: float, expiry: str | None = None,
                        if row.get("expiry") or row.get("expiration")})
     return {"available": bool(contracts), "symbol": "BANKNIFTY", "underlying_symbol": "^NSEBANK",
             "underlying_price": spot, "atm_strike": atm, "expiries": expiries,
-            "contracts": contracts, "source": "OpenBB", "research_only": True}
+            "contracts": contracts, "source": raw.get("source", "OpenBB"), "research_only": True}
 
 
 def _float(value) -> float | None:

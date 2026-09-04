@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
 from .analysis import CandleCache, DeepAnalysisCache, QuickSignalEngine, TIMEFRAMES
-from .banknifty_options import UNAVAILABLE_MESSAGE, build_chain
+from .banknifty_options import NSEOptionChainClient, UNAVAILABLE_MESSAGE, build_chain
 from .diagnostics import diagnostics
 from .config import load_project_env
 from .execution import PaperBroker
@@ -200,22 +200,29 @@ def create_app() -> FastAPI:
     @app.get("/api/banknifty-options")
     def banknifty_options(expiry: str | None = None, option_type: str | None = None,
                           moneyness: str | None = None):
-        """Return a genuine OpenBB chain or an explicit, non-error unavailable state."""
+        """Return a genuine OpenBB/NSE chain or an explicit unavailable state."""
         try:
             provider = OpenBBClient(asset_class="index")
             raw = provider.option_chain("BANKNIFTY", expiry)
             if not raw.get("contracts"):
                 raise ValueError("OpenBB returned no BANKNIFTY option contracts")
             spot = provider.snapshot("^NSEBANK").price
-            result = build_chain(raw, spot, expiry, option_type, moneyness)
-            # Filters may legitimately select no contracts while the provider remains available.
-            result["available"] = True
-            return result
         except Exception as exc:
             diagnostics.failure("openbb", exc)
-            return {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
-                    "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
-                    "research_only": True}
+            try:
+                raw = NSEOptionChainClient().option_chain(expiry)
+                if not raw.get("contracts") or raw.get("underlying_price") is None:
+                    raise ValueError("NSE returned no usable BANKNIFTY option contracts")
+                spot = raw["underlying_price"]
+            except Exception as nse_exc:
+                diagnostics.failure("nse", nse_exc)
+                return {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
+                        "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
+                        "research_only": True}
+        result = build_chain(raw, spot, expiry, option_type, moneyness)
+        # Filters may legitimately select no contracts while the provider remains available.
+        result["available"] = True
+        return result
 
     @app.get("/api/markets")
     def markets():
