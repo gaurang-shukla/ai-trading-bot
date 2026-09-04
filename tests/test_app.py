@@ -45,7 +45,7 @@ def test_project_env_loading_does_not_depend_on_working_directory(tmp_path):
 def test_external_integrations_use_configuration_readiness():
     configured = {
         "OPENBB_API_URL": "http://openbb:6900",
-        "PAPERCLIP_API_URL": "http://paperclip:3100",
+        "PAPERCLIP_BRIDGE_TOKEN": "inbound-secret",
         "OPENAI_API_KEY": "test-key",
     }
     with patch.dict(os.environ, configured, clear=True), \
@@ -54,6 +54,40 @@ def test_external_integrations_use_configuration_readiness():
     assert status["openbb"]["ready"] is True
     assert status["tradingagents"]["ready"] is True
     assert status["paperclip"]["ready"] is True
+
+
+def test_paperclip_api_url_alone_is_not_ready():
+    with patch.dict(os.environ, {"PAPERCLIP_API_URL": "http://paperclip:3100"}, clear=True):
+        status = integration_status()["paperclip"]
+    assert status["configured"] is False
+    assert status["ready"] is False
+
+
+def test_paperclip_task_bridge_requires_url_and_key():
+    for incomplete in (
+        {"PAPERCLIP_TASK_BRIDGE_URL": "http://bridge/events"},
+        {"PAPERCLIP_API_KEY": "outbound-secret"},
+    ):
+        with patch.dict(os.environ, incomplete, clear=True):
+            assert integration_status()["paperclip"]["ready"] is False
+
+    with patch.dict(os.environ, {
+        "PAPERCLIP_TASK_BRIDGE_URL": "http://bridge/events",
+        "PAPERCLIP_API_KEY": "outbound-secret",
+    }, clear=True):
+        assert integration_status()["paperclip"]["ready"] is True
+
+
+def test_tradingagents_states_remain_independent():
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
+            patch.object(importlib.util, "find_spec", return_value=None):
+        status = integration_status()["tradingagents"]
+    assert status == {
+        "installed": False,
+        "configured": True,
+        "ready": False,
+        "role": "multi-agent market decision",
+    }
 
 
 def test_market_registry_is_exposed():
