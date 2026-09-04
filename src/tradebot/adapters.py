@@ -15,12 +15,20 @@ from .diagnostics import diagnostics
 
 
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
+INDIAN_RESEARCH_SYMBOLS = {
+    "BANKNIFTY": "^NSEBANK",
+    "NIFTY50": "^NSEI",
+    "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
+    "MIDCPNIFTY": "NIFTY_MID_SELECT.NS",
+}
 logger = logging.getLogger(__name__)
 
 
 def research_symbol(symbol: str) -> str:
     """Translate an exchange crypto pair into the format used by research feeds."""
     value = symbol.upper().replace("/", "").replace(":", "")
+    if value in INDIAN_RESEARCH_SYMBOLS:
+        return INDIAN_RESEARCH_SYMBOLS[value]
     if "-" in value:
         return value
     for quote in _CRYPTO_QUOTES:
@@ -86,8 +94,8 @@ class OpenBBClient:
         normalized = [row for row in normalized if row.get("strike") is not None]
         expiries = sorted({row["expiration"] for row in normalized if row.get("expiration")})
         strikes = sorted({row["strike"] for row in normalized})
-        calls = sum((row.get("open_interest") or 0) for row in normalized if row.get("option_type") == "call")
-        puts = sum((row.get("open_interest") or 0) for row in normalized if row.get("option_type") == "put")
+        calls = sum((row.get("open_interest") or 0) for row in normalized if row.get("option_type") == "CE")
+        puts = sum((row.get("open_interest") or 0) for row in normalized if row.get("option_type") == "PE")
         return {"symbol": symbol.upper(), "source": "OpenBB", "expiries": expiries,
                 "strikes": strikes, "put_call_ratio": puts / calls if calls else None,
                 "max_pain": _max_pain(normalized), "contracts": normalized}
@@ -373,14 +381,21 @@ def _extract_number(raw: str, label: str) -> float | None:
 def _normalize_option(row: dict) -> dict:
     def first(*keys):
         return next((row[k] for k in keys if row.get(k) is not None), None)
-    return {"expiration": first("expiration", "expiration_date"),
+    raw_type = str(first("option_type", "type") or "").upper()
+    option_type = {"CALL": "CE", "C": "CE", "PUT": "PE", "P": "PE"}.get(raw_type, raw_type)
+    return {"expiration": first("expiration", "expiration_date", "expiry"),
             "strike": _optional_float(first("strike", "strike_price")),
-            "option_type": str(first("option_type", "type") or "").lower(),
+            "option_type": option_type,
             "open_interest": _optional_float(first("open_interest", "openInterest")),
             "iv": _optional_float(first("implied_volatility", "iv")),
             "delta": _optional_float(first("delta")), "gamma": _optional_float(first("gamma")),
             "theta": _optional_float(first("theta")), "vega": _optional_float(first("vega")),
-            "last_price": _optional_float(first("last_price", "last"))}
+            "last_price": _optional_float(first("last_price", "last", "ltp")),
+            "change": _optional_float(first("change", "change_percent", "percent_change")),
+            "volume": _optional_float(first("volume", "total_volume")),
+            "bid": _optional_float(first("bid", "bid_price")),
+            "ask": _optional_float(first("ask", "ask_price")),
+            "underlying_price": _optional_float(first("underlying_price", "underlyingPrice", "spot"))}
 
 
 def _max_pain(rows: list[dict]) -> float | None:
@@ -388,7 +403,7 @@ def _max_pain(rows: list[dict]) -> float | None:
     if not strikes:
         return None
     def payout(at):
-        return sum((max(0, at-r["strike"]) if r.get("option_type") == "call" else
+        return sum((max(0, at-r["strike"]) if r.get("option_type") == "CE" else
                     max(0, r["strike"]-at)) * (r.get("open_interest") or 0) for r in rows)
     return min(strikes, key=payout)
 

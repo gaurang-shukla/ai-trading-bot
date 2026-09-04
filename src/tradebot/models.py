@@ -19,6 +19,8 @@ class MarketKind(str, Enum):
     FOREX = "forex"
     COMMODITIES = "commodities"
     OPTIONS = "options"
+    INDIAN_INDICES = "indian_indices"
+    BANKNIFTY_OPTIONS = "banknifty_options"
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,27 @@ class Candle:
     low: float
     close: float
     volume: float | None = None
+
+
+@dataclass(frozen=True)
+class IndexOption:
+    expiry: str | None
+    strike: float
+    option_type: str
+    last_price: float | None
+    change: float | None
+    volume: float | None
+    open_interest: float | None
+    implied_volatility: float | None
+    delta: float | None
+    gamma: float | None
+    theta: float | None
+    vega: float | None
+    bid: float | None
+    ask: float | None
+    underlying_price: float
+    moneyness: str
+    distance_from_spot_pct: float
 
 
 @dataclass(frozen=True)

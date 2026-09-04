@@ -1,4 +1,6 @@
 import importlib.util
+import logging
+import math
 import os
 import secrets
 import json
@@ -21,7 +23,8 @@ from .analysis import CandleCache, DeepAnalysisCache, QuickSignalEngine, TIMEFRA
 from .diagnostics import diagnostics
 from .config import load_project_env
 from .execution import PaperBroker
-from .models import MarketKind, MarketSelection
+from .models import MarketKind, MarketSelection, Side, TradeSignal
+from .options import prepare_chain
 from .overview import market_overview
 from .risk import RiskEngine, RiskLimits
 from .service import TradingService
@@ -36,6 +39,9 @@ signals = TradingAgentsClient()
 quick_signals = QuickSignalEngine()
 deep_cache = DeepAnalysisCache()
 candle_cache = CandleCache()
+logger = logging.getLogger(__name__)
+INDIAN_DEEP_UNAVAILABLE = ("Deep AI unavailable for this Indian asset because provider "
+                           "OHLCV data is incomplete. Quick Signal remains available.")
 
 
 class AnalyzeRequest(BaseModel):
@@ -196,6 +202,36 @@ def create_app() -> FastAPI:
             diagnostics.failure("openbb", exc)
             raise HTTPException(502, f"Option chain could not load: {type(exc).__name__}: {exc}") from exc
 
+    @app.get("/api/banknifty-options")
+    def banknifty_options(expiration: str | None = None, option_type: str | None = None,
+                          moneyness: str | None = None, underlying_side: str = "HOLD"):
+        """Return only genuine OpenBB contracts, normalized for research UI use."""
+        try:
+            chain = OpenBBClient().option_chain("BANKNIFTY", expiration)
+            rows = chain.get("contracts") or []
+            if not rows:
+                raise ValueError("OpenBB returned no Bank Nifty option contracts")
+            spot_provider = default_registry().market_data(MarketSelection(
+                MarketKind.BANKNIFTY_OPTIONS, "openbb", "BANKNIFTY"))
+            spot = spot_provider.snapshot("BANKNIFTY").price
+            prepared = prepare_chain(rows, spot, underlying_side, option_type, moneyness)
+            if not prepared["contracts"] and not (option_type or moneyness):
+                raise ValueError("OpenBB contracts had no usable CE/PE rows")
+            return {"available": True, "symbol": "BANKNIFTY", "display_symbol": "BANK NIFTY",
+                    "source": "OpenBB", "underlying_price": spot,
+                    "expiries": chain.get("expiries") or [], **prepared,
+                    "notice": "Research only. Live options trading is disabled."}
+        except Exception as exc:
+            logger.warning("Bank Nifty options unavailable: %s: %s", type(exc).__name__, exc)
+            result = {"available": False, "symbol": "BANKNIFTY", "display_symbol": "BANK NIFTY",
+                      "source": "unavailable", "underlying_price": None, "expiries": [],
+                      "atm_strike": None, "contracts": [],
+                      "message": "Bank Nifty options data provider not configured yet.",
+                      "notice": "Research only. Live options trading is disabled."}
+            if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes"}:
+                result["debug_reason"] = f"{type(exc).__name__}: {exc}"
+            return result
+
     @app.get("/api/markets")
     def markets():
         return default_registry().choices()
@@ -213,8 +249,36 @@ def create_app() -> FastAPI:
 
     def run_deep_analysis(request: AnalyzeRequest):
         try:
+            provider = market_data(request)
+            is_indian = (request.market is MarketKind.INDIAN_INDICES or
+                         request.symbol.upper().endswith(".NS"))
+            if is_indian:
+                usable = False
+                debug_reasons = []
+                for frame in ("1d", "1h"):
+                    try:
+                        bars = provider.candles(request.symbol.upper(), frame, 30)
+                        usable = any(math.isfinite(bar.close) and bar.close > 0 for bar in bars)
+                        if usable:
+                            break
+                    except Exception as exc:
+                        debug_reasons.append(f"{frame}: {type(exc).__name__}: {exc}")
+                if not usable:
+                    logger.warning("Indian Deep AI OHLCV preflight failed for %s: %s",
+                                   request.symbol.upper(), "; ".join(debug_reasons))
+                    snapshot = provider.snapshot(request.symbol.upper())
+                    fallback = TradeSignal(request.symbol.upper(), Side.HOLD, 0.0,
+                                           INDIAN_DEEP_UNAVAILABLE, "safe_fallback")
+                    result = {"market": snapshot.__dict__, "signal": fallback.__dict__,
+                              "risk": {"approved": False, "reason": INDIAN_DEEP_UNAVAILABLE,
+                                       "intent": None}, "ai_available": False,
+                              "ai_notice": INDIAN_DEEP_UNAVAILABLE,
+                              "notice": "Research and paper-risk decision only. No live order was placed."}
+                    if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes"}:
+                        result["debug_reason"] = "; ".join(debug_reasons) or "no usable closes"
+                    return result
             service = TradingService(
-                market_data(request),
+                provider,
                 signals,
                 RiskEngine(RiskLimits()),
                 PaperBroker(request.equity),
@@ -223,11 +287,18 @@ def create_app() -> FastAPI:
             result = service.run(request.symbol, request.as_of, request.equity)
             result["integrations"] = integration_status()
             result["notice"] = "Research and paper-risk decision only. No live order was placed."
+            if result.get("ai_available") is False and not os.getenv("SIGNAL_DEBUG"):
+                result["ai_notice"] = "Deep AI is temporarily unavailable. Quick Signal remains available."
+                result.pop("warnings", None)
             return result
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(502, f"Analysis could not complete: {exc}") from exc
+            logger.exception("Deep analysis request failed for %s", request.symbol.upper())
+            detail = (f"Analysis could not complete: {type(exc).__name__}: {exc}"
+                      if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes"}
+                      else "Deep AI is temporarily unavailable. Quick Signal remains available.")
+            raise HTTPException(502, detail) from exc
 
     @app.post("/api/analyze")
     def analyze(request: AnalyzeRequest):
@@ -243,10 +314,12 @@ def create_app() -> FastAPI:
             histories, warnings = {}, []
             # Timeframes load concurrently under a tight provider timeout. A partial
             # response is useful and a total candle failure retains the old fast path.
-            with ThreadPoolExecutor(max_workers=len(TIMEFRAMES)) as executor:
+            timeframes = (("5m", "15m", "1h", "1d")
+                          if request.market in (MarketKind.INDIAN_INDICES, MarketKind.BANKNIFTY_OPTIONS) else TIMEFRAMES)
+            with ThreadPoolExecutor(max_workers=len(timeframes)) as executor:
                 futures = {executor.submit(candle_cache.get_or_load, f"{request.market.value}:{symbol}", frame,
                            lambda f=frame: provider.candles(symbol, f, 250)): frame
-                           for frame in TIMEFRAMES}
+                           for frame in timeframes}
                 for future in as_completed(futures):
                     frame = futures[future]
                     try:
