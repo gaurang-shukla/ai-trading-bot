@@ -5,7 +5,7 @@ from tradebot.risk import RiskEngine, RiskLimits
 from tradebot.service import TradingService
 from tradebot.venues import default_registry
 from tradebot.adapters import (CachedSignalProvider, FallbackMarketData, NormalizedMarketData,
-                               TradingAgentsClient, _import_attribute,
+                               TradingAgentsClient, _import_attribute, _parse_side,
                                research_symbol)
 
 
@@ -85,7 +85,11 @@ def test_signal_failure_becomes_a_safe_hold(monkeypatch):
     assert signal.side is Side.HOLD
     assert signal.symbol == "BTCUSDT"
     assert signal.model == "safe_fallback"
-    assert signal.rationale == "AI temporarily unavailable. Showing live market data only."
+    assert signal.rationale == "AI failed: ImportError: missing"
+    from tradebot.diagnostics import diagnostics
+    debug = diagnostics.snapshot(("tradingagents",))["tradingagents"]
+    assert "ImportError: missing" in debug["last_error"]
+    assert "Traceback" in debug["last_traceback"]
 
 
 def test_analysis_cache_reuses_result_within_ttl():
@@ -123,6 +127,31 @@ def test_compatible_import_skips_missing_package_layouts(monkeypatch):
         ("tradingagents.config", "DEFAULT_CONFIG"),
     ))
     assert result == {"layout": "compatible"}
+
+
+def test_tradingagents_structured_recommendation_and_api_key(monkeypatch):
+    class Graph:
+        def __init__(self, debug, config):
+            assert config["quick_think_llm"] == "gpt-4o-mini"
+            assert os.environ["OPENAI_API_KEY"] == "valid-test-key"
+        def propagate(self, symbol, as_of):
+            return {}, "STRONG BUY; Confidence: 88%; Risk Score: 24%; Stop Loss: 95; Take Profit: 120; Probability: 81%; Position Size: 4%"
+    import os
+    monkeypatch.setenv("OPENAI_API_KEY", "valid-test-key")
+    monkeypatch.setattr("tradebot.adapters._import_attribute", lambda candidates: Graph)
+    signal = TradingAgentsClient({"llm_provider": "openai"}).analyze("AAPL", "2026-09-01")
+    assert signal.side is Side.STRONG_BUY
+    assert signal.confidence == .88
+    assert signal.risk_score == .24
+    assert signal.stop_loss == 95
+    assert signal.take_profit == 120
+    assert signal.probability == .81
+    assert signal.position_size_pct == .04
+
+
+def test_all_five_recommendations_parse_without_substring_collisions():
+    assert [_parse_side(value) for value in ("STRONG BUY", "BUY", "STRONG SELL", "SELL", "HOLD")] == [
+        Side.STRONG_BUY, Side.BUY, Side.STRONG_SELL, Side.SELL, Side.HOLD]
 
 
 def test_market_data_failure_does_not_crash_analysis():

@@ -6,8 +6,9 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from tradebot.adapters import PaperclipReporter
-from tradebot.app import app, integration_status
+from tradebot.app import app, integration_status, startup_diagnostics
 from tradebot.config import load_project_env
+from tradebot.diagnostics import diagnostics
 from tradebot.weex import WeexCredentials
 
 
@@ -25,6 +26,36 @@ def test_app_shell_and_status_are_available():
         "openbb", "tradingagents", "paperclip", "weex"
     }
     assert all("ready" in item for item in status.json()["integrations"].values())
+
+    debug = client.get("/debug")
+    assert debug.status_code == 200
+    assert set(debug.json()) == {"openai", "tradingagents", "openbb", "weex", "yahoo", "paperclip"}
+    assert debug.headers["cache-control"] == "no-store"
+    assert "last_success" in debug.json()["openai"]
+    assert "last_traceback" in debug.json()["openai"]
+
+
+def test_debug_bypasses_frontend_and_service_worker(capsys):
+    response = client.get("/debug", headers={"accept": "text/html"})
+    assert response.headers["content-type"].startswith("application/json")
+    worker = client.get("/sw.js").text
+    assert "url.pathname!=='/debug'" in worker
+    startup_diagnostics()
+    output = capsys.readouterr().out
+    for label in ("OpenAI model:", "OpenAI key loaded:", "TradingAgents imported:",
+                  "TradingAgents version:", "Configured LLM:", "Paperclip enabled:",
+                  "WEEX enabled:", "OpenBB enabled:"):
+        assert label in output
+
+
+def test_debug_returns_the_complete_last_traceback():
+    try:
+        raise RuntimeError("diagnostic failure")
+    except RuntimeError as exc:
+        diagnostics.failure("tradingagents", exc)
+    body = client.get("/debug").json()["tradingagents"]
+    assert body["last_error"] == "RuntimeError: diagnostic failure"
+    assert "raise RuntimeError(\"diagnostic failure\")" in body["last_traceback"]
 
 
 def test_project_env_loading_does_not_depend_on_working_directory(tmp_path):
