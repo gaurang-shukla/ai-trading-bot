@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
 from .analysis import CandleCache, DeepAnalysisCache, QuickSignalEngine, TIMEFRAMES
+from .assets import asset_metadata, public_metadata
 from .banknifty_options import NSEOptionChainClient, UNAVAILABLE_MESSAGE, build_chain
 from .diagnostics import diagnostics
 from .config import load_project_env
@@ -228,6 +229,10 @@ def create_app() -> FastAPI:
     def markets():
         return default_registry().choices()
 
+    @app.get("/api/assets/{market}/{symbol}/metadata")
+    def metadata(market: MarketKind, symbol: str):
+        return public_metadata(market, symbol)
+
     @app.get("/api/overview/{market}")
     def overview(market: MarketKind):
         try:
@@ -261,6 +266,7 @@ def create_app() -> FastAPI:
             result = service.run(request.symbol, request.as_of, request.equity)
             result["integrations"] = integration_status()
             result["notice"] = "Research and paper-risk decision only. No live order was placed."
+            result.update(public_metadata(request.market, request.symbol))
             return result
         except HTTPException:
             raise
@@ -294,12 +300,24 @@ def create_app() -> FastAPI:
                     except Exception as exc:
                         warnings.append(f"{frame} candles unavailable: {type(exc).__name__}")
             result = quick_signals.analyze(snapshot, request.equity, histories)
+            result.update(public_metadata(request.market, symbol))
+            result.update({"live_price": snapshot.price, "change_24h": snapshot.change_24h,
+                           "volume": snapshot.volume, "source": snapshot.source,
+                           "last_updated": snapshot.as_of})
             if warnings:
                 result["warnings"] = warnings
             result["notice"] = "Deterministic quick signal only. No AI or live order was used."
             return result
         except Exception as exc:
-            raise HTTPException(502, f"Live quick signal could not load: {type(exc).__name__}: {exc}") from exc
+            if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
+                detail = f"Live quick signal could not load: {type(exc).__name__}: {exc}"
+            elif request.market is MarketKind.COMMODITIES:
+                name = asset_metadata(request.market, request.symbol).display_name
+                name = name[name.find("(") + 1:-1] if "(" in name else name
+                detail = f"Live data for {name} is temporarily unavailable. Try again later or choose another commodity."
+            else:
+                detail = "Live market data is temporarily unavailable. Try again later."
+            raise HTTPException(502, detail) from exc
 
     @app.post("/api/analyze/deep")
     def deep_analyze(request: DeepAnalyzeRequest):

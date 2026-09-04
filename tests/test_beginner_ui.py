@@ -14,11 +14,15 @@ def test_generic_options_is_hidden_and_direct_route_is_clear():
 
 
 def test_commodity_display_labels_and_beginner_descriptions_exist():
+    from tradebot.assets import COMMODITIES
     expected = {"CL": "Crude Oil", "ZC": "Corn", "GC": "Gold", "NG": "Natural Gas",
                 "ZW": "Wheat", "SI": "Silver", "HG": "Copper"}
     for symbol, name in expected.items():
-        assert f"{symbol}:'{symbol} ({name})'" in APP_JS
-        assert f"{symbol}:'{name} futures" in APP_JS
+        assert COMMODITIES[symbol].display_name == f"{symbol} ({name})"
+        assert COMMODITIES[symbol].description.startswith(f"{name} futures")
+    # Commodity copy comes from the API rather than a duplicate frontend mapping.
+    assert "commodityDescriptions" not in APP_JS
+    assert "quick.description" in APP_JS
 
 
 def test_internal_commodity_symbols_remain_provider_symbols():
