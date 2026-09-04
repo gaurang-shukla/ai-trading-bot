@@ -48,7 +48,7 @@ class WeexDemoTests(unittest.TestCase):
             WeexDemoFuturesBroker(FakeTransport(), MemoryLedger(), required_margin_type="CROSSED")
         with self.assertRaisesRegex(ValueError, "1x to 5x"):
             WeexDemoFuturesBroker(FakeTransport(), MemoryLedger(), max_leverage=20)
-    def test_live_requires_two_flags(self):
+    def test_live_remains_disabled_even_with_legacy_flags(self):
         with patch.dict(os.environ, {"TRADING_MODE": "live", "WEEX_LIVE_ENABLED": "true"}, clear=True):
             self.assertFalse(live_execution_enabled())
 

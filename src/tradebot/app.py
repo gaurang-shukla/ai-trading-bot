@@ -49,8 +49,11 @@ def integration_status() -> dict:
     tradingagents_configured = any(os.getenv(key) for key in (
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
         "GROQ_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"))
-    paperclip_configured = bool(paperclip.base_url or os.getenv("PAPERCLIP_BRIDGE_TOKEN")
-                                or paperclip.configured)
+    # PAPERCLIP_API_URL identifies the upstream service but does not provide an
+    # authenticated path in either direction.  Signal is ready to integrate only
+    # when Paperclip can call its protected endpoint, or when Signal can report to
+    # an authenticated task bridge.
+    paperclip_configured = bool(os.getenv("PAPERCLIP_BRIDGE_TOKEN") or paperclip.configured)
     return {
         "openbb": {
             # OpenBB is consumed as a service, so its Python package need not be local.
