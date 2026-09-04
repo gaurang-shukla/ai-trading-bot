@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from statistics import mean
 
 from .adapters import OpenBBClient, WeexFuturesMarketData, WeexSpotMarketData, YahooFinanceClient
+from .assets import asset_metadata
 from .models import MarketKind, MarketSnapshot
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,8 @@ SEED_UNIVERSES = {
 
 YAHOO_SYMBOLS = {
     **{symbol: f"{symbol}=X" for symbol in SEED_UNIVERSES[MarketKind.FOREX]},
-    **{symbol: f"{symbol}=F" for symbol in SEED_UNIVERSES[MarketKind.COMMODITIES]},
+    **{symbol: asset_metadata(MarketKind.COMMODITIES, symbol).provider_symbol
+       for symbol in SEED_UNIVERSES[MarketKind.COMMODITIES]},
 }
 
 
@@ -118,7 +120,9 @@ class MarketOverviewService:
             return [(symbol, OpenBBClient(asset_class="equity"))]
         asset_class = {MarketKind.EQUITIES: "equity", MarketKind.FOREX: "currency",
                        MarketKind.COMMODITIES: "commodity"}.get(market, "equity")
-        return [(symbol, OpenBBClient(asset_class=asset_class)),
+        openbb_symbol = (asset_metadata(market, symbol).provider_symbol
+                         if market is MarketKind.COMMODITIES else symbol)
+        return [(openbb_symbol, OpenBBClient(asset_class=asset_class)),
                 (yahoo_symbol, YahooFinanceClient())]
 
     def _load_symbol(self, market: MarketKind, symbol: str) -> tuple[dict, str]:
@@ -136,7 +140,13 @@ class MarketOverviewService:
                 if normalized.change_24h is None and index < len(providers) - 1:
                     raise ValueError("quote did not include daily change")
                 logger.info("%s\nProvider: %s", symbol, normalized.source)
-                return _snapshot_row(symbol, normalized), normalized.source
+                row = _snapshot_row(symbol, normalized)
+                if market is MarketKind.COMMODITIES:
+                    metadata = asset_metadata(market, symbol)
+                    row.update({"provider_symbol": metadata.provider_symbol,
+                                "display_name": metadata.display_name,
+                                "description": metadata.description})
+                return row, normalized.source
             except Exception as exc:
                 reason = f"{type(exc).__name__}: {exc}"
                 logger.warning("%s %s failed: %s", symbol, type(provider).__name__, reason)
@@ -185,7 +195,11 @@ class MarketOverviewService:
                         "total_quote_volume": None},
             "gainers": [], "losers": [],
             "assets": [{"symbol": symbol, "price": None, "change": None,
-                        "volume": None, "signal_score": None} for symbol in symbols],
+                        "volume": None, "signal_score": None,
+                        **({"provider_symbol": asset_metadata(market, symbol).provider_symbol,
+                            "display_name": asset_metadata(market, symbol).display_name,
+                            "description": asset_metadata(market, symbol).description}
+                           if market is MarketKind.COMMODITIES else {})} for symbol in symbols],
             "warning": "Live market data is temporarily unavailable.",
         }
 

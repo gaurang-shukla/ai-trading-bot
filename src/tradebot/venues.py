@@ -4,6 +4,7 @@ from .adapters import (FallbackMarketData, MarketData, NormalizedMarketData,
                        OpenBBClient, WeexFuturesMarketData, WeexSpotMarketData,
                        YahooFinanceClient)
 from .models import MarketKind, MarketSelection
+from .assets import ProviderSymbolMarketData
 
 
 class VenueRegistry:
@@ -38,8 +39,13 @@ def default_registry() -> VenueRegistry:
     for market in (MarketKind.EQUITIES, MarketKind.FOREX, MarketKind.COMMODITIES):
         asset_class = {MarketKind.EQUITIES: "equity", MarketKind.FOREX: "currency",
                        MarketKind.COMMODITIES: "commodity"}[market]
-        registry.register(market, "openbb", lambda kind=asset_class: FallbackMarketData(
-            OpenBBClient(asset_class=kind), YahooFinanceClient()))
+        factory = lambda kind=asset_class: FallbackMarketData(
+            OpenBBClient(asset_class=kind), YahooFinanceClient())
+        if market is MarketKind.COMMODITIES:
+            registry.register(market, "openbb", lambda factory=factory:
+                              ProviderSymbolMarketData(factory(), MarketKind.COMMODITIES))
+        else:
+            registry.register(market, "openbb", factory)
     registry.register(MarketKind.OPTIONS, "openbb", lambda: OpenBBClient(asset_class="equity"))
     registry.register(MarketKind.BANKNIFTY_OPTIONS, "openbb", lambda: OpenBBClient(asset_class="index"))
     # Yahoo is primary and OpenBB is the only fallback; WEEX is crypto-only.
