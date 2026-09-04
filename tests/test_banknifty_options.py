@@ -1,3 +1,4 @@
+import time
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
@@ -107,13 +108,21 @@ def test_atm_strike_calculation_and_score_schema():
 def test_indian_deep_ai_missing_ohlcv_has_clean_fallback():
     provider = Mock()
     provider.candles.return_value = []
+    provider.snapshot.return_value = MarketSnapshot("RELIANCE.NS", 1200, "2026-09-04T00:00:00Z", "test")
     registry = Mock()
     registry.market_data.return_value = provider
     with patch("tradebot.app.default_registry", return_value=registry):
         response = client.post("/api/analyze/deep", json={"market": MarketKind.EQUITIES.value,
             "venue": "openbb", "symbol": "RELIANCE.NS", "equity": 100000, "refresh": True})
+        job_id = response.json()["job_id"]
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            result = client.get(f"/api/analyze/deep/status/{job_id}").json()
+            if result["status"] not in {"queued", "running"}:
+                break
+            time.sleep(.01)
     assert response.status_code == 200
-    assert response.json()["ai_available"] is False
-    assert response.json()["ai_notice"] == (
-        "Deep AI unavailable for this Indian asset because provider OHLCV data is incomplete. "
-        "Quick Signal remains available.")
+    assert result["status"] == "failed"
+    assert result["fallback_result"]["signal"]
+    assert "Quick Signal remains available" in result["user_friendly_error"]
+    assert "debug_error" not in result

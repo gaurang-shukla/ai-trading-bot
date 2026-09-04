@@ -3,9 +3,9 @@ import os
 import secrets
 import json
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
-from .analysis import (CandleCache, DeepAnalysisCache, QuickSignalEngine, TIMEFRAMES,
+from .analysis import (CandleCache, DeepJobRegistry, QuickSignalEngine, TIMEFRAMES,
                        normalize_deep_reasoning)
 from .assets import asset_metadata, public_metadata
 from .banknifty_options import NSEOptionChainClient, UNAVAILABLE_MESSAGE, build_chain
@@ -37,7 +37,7 @@ WEB_DIR = Path(__file__).with_name("web")
 load_project_env()
 signals = TradingAgentsClient()
 quick_signals = QuickSignalEngine()
-deep_cache = DeepAnalysisCache()
+deep_jobs = DeepJobRegistry()
 candle_cache = CandleCache()
 
 
@@ -326,6 +326,11 @@ def create_app() -> FastAPI:
             result.update({"live_price": snapshot.price, "change_24h": snapshot.change_24h,
                            "volume": snapshot.volume, "source": snapshot.source,
                            "last_updated": snapshot.as_of})
+            chart_bars = histories.get("1h") or histories.get("15m") or next(
+                (bars for bars in histories.values() if bars), [])
+            result["chart_points"] = [
+                {"timestamp": bar.timestamp, "close": bar.close} for bar in chart_bars[-80:]
+            ]
             if warnings:
                 result["warnings"] = warnings
             result["notice"] = "Deterministic quick signal only. No AI or live order was used."
@@ -343,34 +348,39 @@ def create_app() -> FastAPI:
 
     @app.post("/api/analyze/deep")
     def deep_analyze(request: DeepAnalyzeRequest):
-        def bounded_run():
-            timeout = max(0.01, float(os.getenv("SIGNAL_DEEP_AI_TIMEOUT_SECONDS", "90")))
-            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deep-ai")
-            future = executor.submit(run_deep_analysis, request)
-            try:
-                deep = future.result(timeout=timeout)
-            except FutureTimeoutError as exc:
-                future.cancel()
-                quick = quick_analyze(request)
-                quick.update({"ai_available": False, "timed_out": True,
-                    "ai_notice": "Deep AI took too long, so the app is showing the deterministic Quick Signal summary instead. You can retry Deep AI later."})
-                if _debug_enabled():
-                    quick["debug_error"] = f"Deep AI timeout after {timeout:g} seconds: {type(exc).__name__}"
-                return quick
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
-            if deep.get("ai_available") is False:
-                return deep
+        quick_context = {}
+
+        def perform(progress):
+            progress(1, "Preparing market data")
             quick = quick_analyze(request)
+            quick_context["result"] = quick
+            progress(2, "Checking technical indicators")
+            progress(3, "Running TradingAgents research")
+            deep = run_deep_analysis(request)
+            if deep.get("ai_available") is False:
+                raise RuntimeError(deep.get("ai_notice") or "Deep AI is unavailable")
+            progress(4, "Building plain-language summary")
             merged = {**quick, **deep, "quick_signal": quick}
             for key in ("live_price", "change_24h", "volume", "source", "last_updated",
                         "timeframe_breakdown", "key_levels", "trend_summary",
-                        "momentum_summary", "volatility_summary"):
+                        "momentum_summary", "volatility_summary", "chart_points"):
                 merged[key] = quick.get(key)
-            return normalize_deep_reasoning(merged, quick)
+            progress(5, "Finalizing decision")
+            result = normalize_deep_reasoning(merged, quick)
+            result.update({"mode": "deep", "cached": False,
+                           "deep_analyzed_at": datetime.now(timezone.utc).isoformat()})
+            return result
 
-        return deep_cache.get_or_run(request.market.value, request.symbol, bounded_run,
-                                     refresh=request.refresh)
+        return deep_jobs.start(request.market.value, request.symbol, perform,
+                               lambda: quick_context.get("result") or quick_analyze(request),
+                               refresh=request.refresh)
+
+    @app.get("/api/analyze/deep/status/{job_id}")
+    def deep_status(job_id: str):
+        job = deep_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(404, "Deep AI job not found")
+        return job
 
     @app.post("/api/paperclip/analyze")
     def paperclip_analyze(payload: PaperclipRunRequest, authorization: str = Header(default="")):

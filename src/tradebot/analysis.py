@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import asdict
 from datetime import datetime, timezone
 from math import log10
@@ -228,11 +230,119 @@ class DeepAnalysisCache:
                 "deep_analyzed_at": entry[1]}
 
 
+class DeepJobRegistry:
+    """Process-local Deep AI jobs with de-duplication and completed-result caching."""
+
+    ACTIVE = {"queued", "running"}
+    TERMINAL = {"completed", "failed", "timed_out"}
+    STEPS = (
+        "Preparing market data", "Checking technical indicators",
+        "Running TradingAgents research", "Building plain-language summary",
+        "Finalizing decision",
+    )
+
+    def __init__(self, ttl_seconds: float | None = None):
+        self.ttl_seconds = ttl_seconds or float(os.getenv("DEEP_ANALYSIS_CACHE_TTL_SECONDS", "1200"))
+        self._jobs: dict[str, dict] = {}
+        self._latest: dict[tuple[str, str], str] = {}
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="deep-job")
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def start(self, market: str, symbol: str, runner: Callable[[Callable[[int, str], None]], dict],
+              fallback: Callable[[], dict], refresh: bool = False) -> dict:
+        key = (market, symbol.upper())
+        with self._lock:
+            previous = self._jobs.get(self._latest.get(key, ""))
+            if previous and previous["status"] in self.ACTIVE:
+                return self._public(previous)
+            if previous and previous["status"] == "completed" and not refresh:
+                age = time.monotonic() - previous["completed_monotonic"]
+                if age < self.ttl_seconds:
+                    response = self._public(previous)
+                    response["cached"] = True
+                    return response
+            now = self._now()
+            job = {"job_id": uuid.uuid4().hex, "market": market, "symbol": symbol.upper(),
+                   "status": "queued", "started_at": now, "updated_at": now,
+                   "completed_at": None, "progress_step": 0,
+                   "progress_message": self.STEPS[0], "result": None,
+                   "fallback_result": None, "user_friendly_error": None,
+                   "debug_error": None, "started_monotonic": time.monotonic()}
+            self._jobs[job["job_id"]] = job
+            self._latest[key] = job["job_id"]
+            self._executor.submit(self._execute, job["job_id"], runner, fallback)
+            return self._public(job)
+
+    def _execute(self, job_id: str, runner: Callable, fallback: Callable[[], dict]) -> None:
+        self._update(job_id, status="running", progress_step=1,
+                     progress_message=self.STEPS[0])
+        timeout = max(.01, float(os.getenv("SIGNAL_DEEP_AI_TIMEOUT_SECONDS", "90")))
+        inner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deep-ai-work")
+        future = inner.submit(runner, lambda step, message: self._progress(job_id, step, message))
+        try:
+            result = future.result(timeout=timeout)
+            self._update(job_id, status="completed", progress_step=len(self.STEPS),
+                         progress_message=self.STEPS[-1], result=result,
+                         completed_at=self._now(), completed_monotonic=time.monotonic())
+        except FutureTimeoutError as exc:
+            message = "Deep AI reached its backend time limit. Quick Signal remains available."
+            self._terminal_error(job_id, "timed_out", message, exc, fallback)
+        except Exception as exc:
+            message = "Deep AI could not complete. Quick Signal remains available."
+            self._terminal_error(job_id, "failed", message, exc, fallback)
+        finally:
+            # Running provider calls cannot safely be killed; do not block this worker.
+            inner.shutdown(wait=False, cancel_futures=True)
+
+    def _terminal_error(self, job_id: str, status: str, message: str, exc: Exception,
+                        fallback: Callable[[], dict]) -> None:
+        try:
+            fallback_result = fallback()
+        except Exception:
+            fallback_result = None
+        fields = {"status": status, "completed_at": self._now(),
+                  "fallback_result": fallback_result, "user_friendly_error": message}
+        if _signal_debug_enabled():
+            fields["debug_error"] = f"{type(exc).__name__}: {exc}"
+        self._update(job_id, **fields)
+
+    def _progress(self, job_id: str, step: int, message: str) -> None:
+        self._update(job_id, progress_step=max(1, min(len(self.STEPS), step)),
+                     progress_message=message)
+
+    def _update(self, job_id: str, **fields) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.update(fields)
+                job["updated_at"] = self._now()
+
+    def get(self, job_id: str) -> dict | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return self._public(job) if job else None
+
+    @staticmethod
+    def _public(job: dict) -> dict:
+        result = {key: value for key, value in job.items()
+                  if not key.endswith("_monotonic") and (key != "debug_error" or value)}
+        result["elapsed_seconds"] = round(time.monotonic() - job["started_monotonic"], 1)
+        return result
+
+
+def _signal_debug_enabled() -> bool:
+    return os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
 def normalize_deep_reasoning(deep: dict, quick: dict) -> dict:
     """Keep good agent prose, but expand terse decisions using deterministic evidence."""
     signal = deep.setdefault("signal", {})
     rationale = str(signal.get("rationale") or deep.get("plain_language_reason") or "").strip()
-    if len(rationale.split()) > 8 and rationale.upper() not in {"HOLD", "BUY", "SELL"}:
+    if len(rationale.split()) >= 40 and rationale.upper() not in {"HOLD", "BUY", "SELL"}:
         deep["plain_language_reason"] = rationale
         return deep
 
