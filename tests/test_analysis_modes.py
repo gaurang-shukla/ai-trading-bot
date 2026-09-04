@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from tradebot.analysis import DeepAnalysisCache, DeepJobRegistry, QuickSignalEngine, normalize_deep_reasoning
 from tradebot.app import app
-from tradebot.models import MarketSnapshot, Side, TradeSignal
+from tradebot.models import Candle, MarketSnapshot, Side, TradeSignal
 
 
 def snapshot():
@@ -146,6 +146,46 @@ def test_background_registry_deduplicates_and_caches_completed_job():
 
 def test_chart_has_payload_and_unavailable_state():
     javascript = TestClient(app).get("/assets/app.js").text
-    assert "chart_points" in javascript
+    assert "chart_timeframes" in javascript
     assert "Chart unavailable" in javascript
-    assert "Recent price line chart" in javascript
+    assert "candlestick price chart" in javascript
+
+
+def test_chart_renders_candles_timeframes_and_collision_safe_labels():
+    javascript = TestClient(app).get("/assets/app.js").text
+    for frame in ("1m", "5m", "15m", "1h", "4h", "1d"):
+        assert f"'{frame}'" in javascript
+    assert 'class="candle ${up?' in javascript
+    assert "placeChartLabels" in javascript
+    assert "labelY+spacing" in javascript
+    assert "Math.max(top,Math.min(bottom" in javascript
+    assert "chart-label-pill" in javascript
+    assert "current_price" in javascript
+
+
+def test_quick_api_reuses_ohlcv_for_chart_without_extra_fetch():
+    provider = Mock()
+    provider.snapshot.return_value = snapshot()
+    provider.candles.side_effect = lambda _symbol, frame, _limit: [
+        Candle(i, 100 + i, 102 + i, 99 + i, 101 + i, 1_000 + i)
+        for i in range(30)
+    ]
+    registry = Mock()
+    registry.market_data.return_value = provider
+    with patch("tradebot.app.default_registry", return_value=registry):
+        response = TestClient(app).post("/api/analyze/quick", json={"symbol": "CHARTTESTUSDT"})
+    assert response.status_code == 200
+    result = response.json()
+    assert set(result["chart_timeframes"]) == {"1m", "5m", "15m", "1h", "4h", "1d"}
+    assert result["chart_default_timeframe"] == "1h"
+    candle = result["chart_timeframes"]["1h"][0]
+    assert {"timestamp", "open", "high", "low", "close", "volume"} == set(candle)
+    assert provider.candles.call_count == 6
+
+
+def test_empty_candles_keep_live_price_card_and_chart_unavailable():
+    javascript = TestClient(app).get("/assets/app.js").text
+    assert 'class="live-price"' in javascript
+    assert "data.live_price??marketData.price" in javascript
+    assert "bars.length<2" in javascript
+    assert "Chart unavailable" in javascript
