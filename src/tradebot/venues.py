@@ -41,6 +41,7 @@ def default_registry() -> VenueRegistry:
         registry.register(market, "openbb", lambda kind=asset_class: FallbackMarketData(
             OpenBBClient(asset_class=kind), YahooFinanceClient()))
     registry.register(MarketKind.OPTIONS, "openbb", lambda: OpenBBClient(asset_class="equity"))
+    registry.register(MarketKind.BANKNIFTY_OPTIONS, "openbb", lambda: OpenBBClient(asset_class="index"))
     # Yahoo is primary and OpenBB is the only fallback; WEEX is crypto-only.
     registry.register(MarketKind.INDIAN_INDICES, "openbb", lambda: FallbackMarketData(
         NormalizedMarketData(YahooFinanceClient()),
