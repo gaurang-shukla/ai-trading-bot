@@ -1,8 +1,32 @@
 from unittest.mock import patch
 
-from tradebot.models import MarketKind
-from tradebot.models import MarketSnapshot
+from tradebot.adapters import normalize_weex_24h_change
+from tradebot.models import MarketKind, MarketSnapshot
 from tradebot.overview import CachedMarketOverview, MarketOverviewService, crypto_overview
+
+
+def test_weex_ratio_change_fields_are_normalized_to_percentage_points():
+    assert normalize_weex_24h_change({"symbol": "BULLAUSDT", "changeRate": 2.104292}) == 210.4292
+    assert normalize_weex_24h_change({"change": 0.0211}) == 2.11
+    assert normalize_weex_24h_change({"riseFallRate": -0.006}) == -0.6
+    assert normalize_weex_24h_change({"change_rate": 0.0211}) == 2.11
+
+
+def test_weex_percentage_point_changes_are_not_multiplied_again():
+    assert normalize_weex_24h_change({"priceChangePercent": 211.41}) == 211.41
+    assert normalize_weex_24h_change({"changePercent": 211.41}) == 211.41
+    assert normalize_weex_24h_change({"changeRate": "211.41%"}) == 211.41
+
+
+def test_crypto_overview_normalizes_bulla_change_rate():
+    tickers = [{"symbol": "BULLAUSDT", "lastPrice": "0.086498", "changeRate": 2.104292}]
+
+    with patch("tradebot.overview.WeexFuturesMarketData.tickers", return_value=tickers):
+        result = crypto_overview(MarketKind.CRYPTO_FUTURES)
+
+    assert result["assets"][0]["change"] == 210.4292
+    assert result["gainers"][0]["symbol"] == "BULLAUSDT"
+    assert result["gainers"][0]["change"] == 210.4292
 
 
 def test_crypto_overview_ranks_real_ticker_fields():

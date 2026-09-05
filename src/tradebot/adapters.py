@@ -27,16 +27,17 @@ logger = logging.getLogger(__name__)
 def normalize_weex_24h_change(row: dict) -> float | None:
     """Normalize WEEX's field-specific 24-hour change formats to percentage points.
 
-    WEEX ``changeRate`` is a ratio (2.0535 means 205.35%), whereas
-    ``priceChangePercent`` is already expressed in percentage points.  A literal
-    percent suffix is unambiguous regardless of which field supplied it.
+    WEEX's rate fields are ratios (2.0535 means 205.35%), whereas its percent
+    fields are already expressed in percentage points. A literal percent suffix
+    is unambiguous regardless of which field supplied it.
     """
-    if row.get("changeRate") is not None:
-        raw, ratio = row["changeRate"], True
-    elif row.get("priceChangePercent") is not None:
-        raw, ratio = row["priceChangePercent"], False
-    else:
+    field = next((name for name in ("change", "changeRate", "riseFallRate", "change_rate",
+                                    "priceChangePercent", "changePercent")
+                  if row.get(name) is not None), None)
+    if field is None:
         return None
+    raw = row[field]
+    ratio = field in {"change", "changeRate", "riseFallRate", "change_rate"}
     if isinstance(raw, str) and raw.strip().endswith("%"):
         raw, ratio = raw.strip()[:-1], False
     value = _optional_float(raw)
