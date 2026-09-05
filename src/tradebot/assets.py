@@ -26,8 +26,23 @@ _COMMODITY_NAMES = {
 }
 
 COMMODITIES = {
-    symbol: AssetMetadata(symbol, f"{symbol}=F", f"{symbol} ({name})", description)
+    symbol: AssetMetadata(symbol, f"{symbol}=F", f"{name} futures", description)
     for symbol, (name, description) in _COMMODITY_NAMES.items()
+}
+
+_FOREX_PAIRS = ("EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD")
+FOREX = {
+    symbol: AssetMetadata(
+        symbol,
+        f"{symbol}=X",
+        f"{symbol[:3]}/{symbol[3:]} forex pair",
+        "In forex, the first currency is the base currency and the second is the quote currency.",
+    )
+    for symbol in _FOREX_PAIRS
+}
+
+_EQUITY_NAMES = {
+    "SBIN.NS": "SBI / State Bank of India",
 }
 
 
@@ -35,6 +50,15 @@ def asset_metadata(market: MarketKind, symbol: str) -> AssetMetadata:
     symbol = symbol.upper()
     if market is MarketKind.COMMODITIES and symbol in COMMODITIES:
         return COMMODITIES[symbol]
+    if market is MarketKind.FOREX and symbol in FOREX:
+        return FOREX[symbol]
+    if market in (MarketKind.CRYPTO_FUTURES, MarketKind.CRYPTO_SPOT) and symbol.endswith("USDT"):
+        return AssetMetadata(symbol, symbol, f"{symbol[:-4]}/USDT", "")
+    if market is MarketKind.EQUITIES:
+        display = _EQUITY_NAMES.get(symbol, f"{symbol.removesuffix('.NS')} shares")
+        return AssetMetadata(symbol, symbol, display, "")
+    if market is MarketKind.INDIAN_INDICES and symbol in _EQUITY_NAMES:
+        return AssetMetadata(symbol, symbol, _EQUITY_NAMES[symbol], "")
     display = symbol.removesuffix(".NS") if symbol.endswith(".NS") else symbol
     return AssetMetadata(symbol, symbol, display, "")
 
