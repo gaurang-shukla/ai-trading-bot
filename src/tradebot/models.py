@@ -125,3 +125,77 @@ class ExecutionReport:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class PaperAccount:
+    starting_balance: float
+    cash_balance: float
+    equity: float
+    realized_pnl: float
+    unrealized_pnl: float
+    total_pnl: float
+    win_rate: float
+    open_positions_count: int
+    closed_trades_count: int
+
+
+@dataclass
+class PaperPosition:
+    id: str
+    market: str
+    symbol: str
+    display_name: str
+    side: str
+    entry_price: float
+    current_price: float
+    quantity: float
+    notional_value: float
+    stop_loss: float | None
+    take_profit: float | None
+    risk_score: float | None
+    confidence: float | None
+    position_size_pct: float | None
+    opened_at: str
+    source_signal_action: str
+    status: str
+    unrealized_pnl: float = 0
+    unrealized_pnl_pct: float = 0
+
+
+@dataclass
+class PaperTrade:
+    id: str
+    position_id: str
+    market: str
+    symbol: str
+    side: str
+    entry_price: float
+    exit_price: float
+    quantity: float
+    realized_pnl: float
+    realized_pnl_pct: float
+    opened_at: str
+    closed_at: str
+    close_reason: str
+    signal_snapshot: dict[str, Any]
+
+
+@dataclass
+class WatchlistItem:
+    market: str
+    symbol: str
+    display_name: str
+    added_at: str
+    latest_action: str | None = None
+    latest_confidence: float | None = None
+    latest_price: float | None = None
+
+
+@dataclass
+class JournalNote:
+    id: str
+    note: str
+    created_at: str
+    position_id: str | None = None
+    symbol: str | None = None

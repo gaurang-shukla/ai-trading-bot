@@ -27,6 +27,7 @@ from .config import load_project_env
 from .execution import PaperBroker
 from .models import MarketKind, MarketSelection, MarketSnapshot
 from .overview import market_overview
+from .paper import PaperStore
 from .risk import RiskEngine, RiskLimits
 from .service import TradingService
 from .venues import default_registry
@@ -85,6 +86,30 @@ class PaperclipRunRequest(BaseModel):
     agentId: str | None = None
     companyId: str | None = None
     context: dict = Field(default_factory=dict)
+
+
+class OpenPaperPositionRequest(BaseModel):
+    market: MarketKind
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._:/-]+$")
+    side: str | None = Field(default=None, pattern=r"^(LONG|SHORT)$")
+    notional_amount: float | None = Field(default=None, gt=0, le=1_000_000_000)
+    force: bool = False
+
+
+class ClosePaperPositionRequest(BaseModel):
+    close_reason: str = Field(default="Closed by user", max_length=200)
+
+
+class WatchlistRequest(BaseModel):
+    market: MarketKind
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._:/-]+$")
+    display_name: str | None = Field(default=None, max_length=100)
+
+
+class JournalRequest(BaseModel):
+    note: str = Field(min_length=1, max_length=4000)
+    position_id: str | None = Field(default=None, max_length=64)
+    symbol: str | None = Field(default=None, max_length=32)
 
 
 def integration_status() -> dict:
@@ -187,6 +212,8 @@ async def lifespan(_app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Signal", version="0.4.0", lifespan=lifespan)
+    paper = PaperStore()
+    app.state.paper_store = paper
     app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
 
     @app.get("/")
@@ -449,6 +476,104 @@ def create_app() -> FastAPI:
 
         return deep_jobs.start(request.market.value, request.symbol, perform, fallback,
                                refresh=request.refresh)
+
+    def _paper_quote(market: str, symbol: str) -> float:
+        selection = MarketSelection(MarketKind(market), "weex" if market.startswith("crypto_") else "openbb",
+                                    symbol.upper())
+        price = float(default_registry().market_data(selection).snapshot(symbol.upper()).price)
+        if price <= 0:
+            raise ValueError("Live price is missing or invalid")
+        return price
+
+    def _mark_open_positions() -> list[dict]:
+        for position in paper.positions():
+            try:
+                paper.mark(position["id"], _paper_quote(position["market"], position["symbol"]))
+            except Exception:
+                # Preserve the last valid mark when a provider is temporarily unavailable.
+                pass
+        return paper.positions()
+
+    @app.get("/api/paper/account")
+    def paper_account():
+        _mark_open_positions()
+        return paper.account()
+
+    @app.get("/api/paper/positions")
+    def paper_positions():
+        return _mark_open_positions()
+
+    @app.post("/api/paper/positions", status_code=201)
+    def open_paper_position(request: OpenPaperPositionRequest):
+        analyze_request = AnalyzeRequest(symbol=request.symbol, market=request.market,
+                                         venue="weex" if request.market.value.startswith("crypto_") else "openbb")
+        quick = quick_results.get(request.market.value, request.symbol) or quick_analyze(analyze_request)
+        raw_action = quick["signal"].get("side", "HOLD")
+        action = str(getattr(raw_action, "value", raw_action)).upper()
+        if action == "HOLD" and not request.force:
+            raise HTTPException(409, "HOLD has no active trade setup. Add it to your watchlist or explicitly use force=true.")
+        side = request.side or ("LONG" if "BUY" in action else "SHORT" if "SELL" in action else None)
+        if side is None:
+            raise HTTPException(422, "Choose LONG or SHORT when forcing a HOLD signal")
+        price = float(quick.get("live_price") or 0)
+        if price <= 0:
+            raise HTTPException(422, "A valid live price is required for a paper trade")
+        plan = quick.get("risk_plan") or {}
+        default_notional = paper.account()["equity"] * float(plan.get("position_size_pct") or .01)
+        notional = request.notional_amount if request.notional_amount is not None else default_notional
+        try:
+            return paper.open_position(market=request.market.value, symbol=request.symbol,
+                    display_name=quick.get("display_name") or request.symbol.upper(), side=side,
+                    price=price, notional=notional, signal=quick["signal"], risk_plan=plan)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/paper/positions/{position_id}/close")
+    def close_paper_position(position_id: str, request: ClosePaperPositionRequest):
+        position = next((x for x in paper.positions() if x["id"] == position_id), None)
+        if not position:
+            raise HTTPException(404, "Open paper position not found")
+        try:
+            return paper.close_position(position_id, _paper_quote(position["market"], position["symbol"]),
+                                        request.close_reason)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/paper/trades")
+    def paper_trades():
+        return paper.trades()
+
+    @app.get("/api/paper/watchlist")
+    def paper_watchlist():
+        return paper.watchlist()
+
+    @app.post("/api/paper/watchlist", status_code=201)
+    def add_paper_watchlist(request: WatchlistRequest):
+        item = request.model_dump(mode="json")
+        item["market"] = request.market.value
+        cached = quick_results.get(request.market.value, request.symbol)
+        if cached:
+            latest_action = cached["signal"].get("side")
+            item.update(latest_action=str(getattr(latest_action, "value", latest_action)),
+                        latest_confidence=cached["signal"].get("confidence"), latest_price=cached.get("live_price"))
+            item["display_name"] = item.get("display_name") or cached.get("display_name")
+        return paper.add_watchlist(item)
+
+    @app.delete("/api/paper/watchlist/{market}/{symbol}", status_code=204)
+    def delete_paper_watchlist(market: MarketKind, symbol: str):
+        if not paper.delete_watchlist(market.value, symbol):
+            raise HTTPException(404, "Watchlist item not found")
+
+    @app.get("/api/paper/journal")
+    def paper_journal():
+        return paper.journal()
+
+    @app.post("/api/paper/journal", status_code=201)
+    def add_paper_journal(request: JournalRequest):
+        try:
+            return paper.add_note(request.note, request.position_id, request.symbol)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     @app.get("/api/analyze/deep/status/{job_id}")
     def deep_status(job_id: str):
