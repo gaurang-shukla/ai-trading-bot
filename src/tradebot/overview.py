@@ -29,7 +29,8 @@ SEED_UNIVERSES = {
 }
 
 YAHOO_SYMBOLS = {
-    **{symbol: f"{symbol}=X" for symbol in SEED_UNIVERSES[MarketKind.FOREX]},
+    **{symbol: asset_metadata(MarketKind.FOREX, symbol).provider_symbol
+       for symbol in SEED_UNIVERSES[MarketKind.FOREX]},
     **{symbol: asset_metadata(MarketKind.COMMODITIES, symbol).provider_symbol
        for symbol in SEED_UNIVERSES[MarketKind.COMMODITIES]},
 }
@@ -120,8 +121,7 @@ class MarketOverviewService:
             return [(symbol, OpenBBClient(asset_class="equity"))]
         asset_class = {MarketKind.EQUITIES: "equity", MarketKind.FOREX: "currency",
                        MarketKind.COMMODITIES: "commodity"}.get(market, "equity")
-        openbb_symbol = (asset_metadata(market, symbol).provider_symbol
-                         if market is MarketKind.COMMODITIES else symbol)
+        openbb_symbol = asset_metadata(market, symbol).provider_symbol
         return [(openbb_symbol, OpenBBClient(asset_class=asset_class)),
                 (yahoo_symbol, YahooFinanceClient())]
 
@@ -141,7 +141,7 @@ class MarketOverviewService:
                     raise ValueError("quote did not include daily change")
                 logger.info("%s\nProvider: %s", symbol, normalized.source)
                 row = _snapshot_row(symbol, normalized)
-                if market is MarketKind.COMMODITIES:
+                if market in (MarketKind.COMMODITIES, MarketKind.FOREX):
                     metadata = asset_metadata(market, symbol)
                     row.update({"provider_symbol": metadata.provider_symbol,
                                 "display_name": metadata.display_name,
@@ -199,7 +199,7 @@ class MarketOverviewService:
                         **({"provider_symbol": asset_metadata(market, symbol).provider_symbol,
                             "display_name": asset_metadata(market, symbol).display_name,
                             "description": asset_metadata(market, symbol).description}
-                           if market is MarketKind.COMMODITIES else {})} for symbol in symbols],
+                           if market in (MarketKind.COMMODITIES, MarketKind.FOREX) else {})} for symbol in symbols],
             "warning": "Live market data is temporarily unavailable.",
         }
 

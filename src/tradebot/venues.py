@@ -43,9 +43,9 @@ def default_registry() -> VenueRegistry:
                        MarketKind.COMMODITIES: "commodity"}[market]
         factory = lambda kind=asset_class: FallbackMarketData(
             OpenBBClient(asset_class=kind), YahooFinanceClient())
-        if market is MarketKind.COMMODITIES:
-            registry.register(market, "openbb", lambda factory=factory:
-                              ProviderSymbolMarketData(factory(), MarketKind.COMMODITIES))
+        if market in (MarketKind.COMMODITIES, MarketKind.FOREX):
+            registry.register(market, "openbb", lambda factory=factory, market=market:
+                              ProviderSymbolMarketData(factory(), market))
         else:
             registry.register(market, "openbb", factory)
     registry.register(MarketKind.OPTIONS, "openbb", lambda: OpenBBClient(asset_class="equity"))

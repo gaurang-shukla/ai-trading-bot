@@ -409,9 +409,12 @@ def create_app() -> FastAPI:
             if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
                 detail = f"Live quick signal could not load: {type(exc).__name__}: {exc}"
             elif request.market is MarketKind.COMMODITIES:
-                name = asset_metadata(request.market, request.symbol).display_name
-                name = name[name.find("(") + 1:-1] if "(" in name else name
+                name = asset_metadata(request.market, request.symbol).display_name.removesuffix(" futures")
                 detail = f"Live data for {name} is temporarily unavailable. Try again later or choose another commodity."
+            elif request.market is MarketKind.FOREX:
+                detail = "Forex data is temporarily unavailable. Try again later."
+            elif request.market in (MarketKind.EQUITIES, MarketKind.INDIAN_INDICES):
+                detail = "Equity data is temporarily unavailable. Try again later."
             else:
                 detail = "Live market data is temporarily unavailable. Try again later."
             raise HTTPException(502, detail) from exc
