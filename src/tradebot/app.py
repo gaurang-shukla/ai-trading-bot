@@ -320,7 +320,19 @@ def create_app() -> FastAPI:
     @app.get("/api/overview/{market}")
     def overview(market: MarketKind, refresh: bool = False):
         try:
-            return market_overview(market, refresh=refresh)
+            result = market_overview(market, refresh=refresh)
+            # A ranking remains independent from an entry decision.  Surface a
+            # previously calculated Quick Signal when one exists without running
+            # dozens of analyses (and provider calls) merely to build an overview.
+            assets = []
+            for source_row in result.get("assets", []):
+                row = dict(source_row)
+                cached = quick_results.get(market.value, row.get("symbol", ""))
+                if cached:
+                    action = cached.get("signal", {}).get("side")
+                    row["current_action"] = str(getattr(action, "value", action))
+                assets.append(row)
+            return {**result, "assets": assets}
         except Exception as exc:
             raise _provider_error("Market data is temporarily unavailable. Try again later.", exc) from exc
 
@@ -532,8 +544,11 @@ def create_app() -> FastAPI:
         quick = quick_results.get(request.market.value, request.symbol) or quick_analyze(analyze_request)
         raw_action = quick["signal"].get("side", "HOLD")
         action = str(getattr(raw_action, "value", raw_action)).upper()
-        if action == "HOLD" and not request.force:
-            raise HTTPException(409, "HOLD has no active trade setup. Add it to your watchlist or explicitly use force=true.")
+        inactive_actions = {"HOLD", "WATCH", "AVOID"}
+        if action in inactive_actions and not request.force:
+            raise HTTPException(409, f"{action} has no active trade setup. Add it to your watchlist instead.")
+        if action in inactive_actions and request.force and not _debug_enabled():
+            raise HTTPException(403, "Forcing an inactive signal is available only in debug/admin mode.")
         side = request.side or ("LONG" if "BUY" in action else "SHORT" if "SELL" in action else None)
         if side is None:
             raise HTTPException(422, "Choose LONG or SHORT when forcing a HOLD signal")
