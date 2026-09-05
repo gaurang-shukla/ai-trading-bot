@@ -41,7 +41,7 @@ def analyze(symbol, provider):
 
 
 def test_gc_and_zw_routes_use_yahoo_futures_symbols_and_public_metadata():
-    for symbol, provider_symbol, name in (("GC", "GC=F", "Gold futures"), ("ZW", "ZW=F", "Wheat futures")):
+    for symbol, provider_symbol, name in (("GC", "GC=F", "Gold"), ("ZW", "ZW=F", "Wheat")):
         provider = RecordingProvider()
         response = analyze(symbol, provider)
         assert response.status_code == 200

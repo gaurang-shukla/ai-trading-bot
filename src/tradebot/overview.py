@@ -142,18 +142,24 @@ class MarketOverviewService:
                     raise ValueError("quote did not include daily change")
                 logger.info("%s\nProvider: %s", symbol, normalized.source)
                 row = _snapshot_row(symbol, normalized)
-                if market in (MarketKind.COMMODITIES, MarketKind.FOREX):
-                    metadata = asset_metadata(market, symbol)
-                    row.update({"provider_symbol": metadata.provider_symbol,
-                                "display_name": metadata.display_name,
-                                "description": metadata.description})
+                metadata = asset_metadata(market, symbol)
+                row.update({"provider_symbol": metadata.provider_symbol,
+                            "display_name": metadata.display_name,
+                            "description": metadata.description,
+                            "instrument_type": metadata.instrument_type})
                 return row, normalized.source
             except Exception as exc:
                 reason = f"{type(exc).__name__}: {exc}"
                 logger.warning("%s %s failed: %s", symbol, type(provider).__name__, reason)
                 errors.append(reason)
         if fallback:
-            return _snapshot_row(symbol, fallback), fallback.source
+            row = _snapshot_row(symbol, fallback)
+            metadata = asset_metadata(market, symbol)
+            row.update({"provider_symbol": metadata.provider_symbol,
+                        "display_name": metadata.display_name,
+                        "description": metadata.description,
+                        "instrument_type": metadata.instrument_type})
+            return row, fallback.source
         raise RuntimeError("; ".join(errors))
 
     def build(self, market: MarketKind) -> dict:
@@ -197,10 +203,10 @@ class MarketOverviewService:
             "gainers": [], "losers": [],
             "assets": [{"symbol": symbol, "price": None, "change": None,
                         "volume": None, "signal_score": None,
-                        **({"provider_symbol": asset_metadata(market, symbol).provider_symbol,
-                            "display_name": asset_metadata(market, symbol).display_name,
-                            "description": asset_metadata(market, symbol).description}
-                           if market in (MarketKind.COMMODITIES, MarketKind.FOREX) else {})} for symbol in symbols],
+                        "provider_symbol": asset_metadata(market, symbol).provider_symbol,
+                        "display_name": asset_metadata(market, symbol).display_name,
+                        "description": asset_metadata(market, symbol).description,
+                        "instrument_type": asset_metadata(market, symbol).instrument_type} for symbol in symbols],
             "warning": "Live market data is temporarily unavailable.",
         }
 
