@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Read-only inspection of raw and normalized WEEX bulk ticker changes."""
 
+from pathlib import Path
 from pprint import pformat
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tradebot.adapters import (WeexFuturesMarketData, WeexSpotMarketData,
                                normalize_weex_ticker_row, weex_change_details)
@@ -26,6 +30,9 @@ def inspect(label, market, client):
         print(f"raw change field selected: {field}")
         print(f"raw change value: {value!r}")
         print(f"normalized change percent: {percent!r}")
+        debug = ticker["_weex_debug"]
+        print(f"computed change ratio from open: {debug['computed_change_ratio_from_open']!r}")
+        print(f"computed change percent from open: {debug['computed_change_percent_from_open']!r}")
         print(f"final provider ticker object: {pformat(ticker)}")
     overview = _score_overview(market, overview_rows, {"WEEX"})
     print("final overview top gainers:")
