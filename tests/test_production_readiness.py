@@ -100,3 +100,15 @@ def test_paper_is_the_only_application_execution_mode(monkeypatch):
     assert client.get("/api/status").json()["mode"] == "paper"
     assert live_execution_enabled() is False
     assert default_registry().choices()
+
+
+def test_paperclip_status_requires_a_real_bridge_configuration(monkeypatch):
+    from tradebot.app import integration_status
+
+    for key in ("PAPERCLIP_TASK_BRIDGE_URL", "PAPERCLIP_API_KEY", "PAPERCLIP_BRIDGE_TOKEN",
+                "PAPERCLIP_ENABLED", "PAPERCLIP_API_URL"):
+        monkeypatch.delenv(key, raising=False)
+    status = integration_status()["paperclip"]
+    assert status["configured"] is False
+    assert status["ready"] is False
+    assert status["enabled"] is False
