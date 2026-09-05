@@ -36,6 +36,7 @@ def test_unavailable_provider_state_does_not_crash_or_return_fake_rows():
     assert response.json()["available"] is False
     assert response.json()["provider_attempts"] == {"openbb": True, "nse_fallback": True}
     assert response.json()["failure_category"] == "provider_unavailable"
+    assert response.json()["provider_status"] == "temporarily_unavailable"
     assert "provider_errors" not in response.json()
 
 
@@ -48,17 +49,17 @@ def test_banknifty_raw_provider_errors_require_debug(monkeypatch):
     assert "private nse detail" in payload["provider_errors"]["nse_fallback"]
 
 
-def test_banknifty_ui_renders_attempt_metadata():
+def test_banknifty_ui_keeps_attempt_metadata_in_compact_details():
     javascript = client.get("/assets/app.js").text
-    assert "OpenBB tried:" in javascript
-    assert "NSE fallback tried:" in javascript
-    assert "Failure category:" in javascript
-    assert "Live Bank Nifty options require a reliable option-chain provider." in javascript
-    assert "Import option-chain CSV" in javascript
-    assert "Imported/demo data, not live" in javascript
+    assert '<details class="provider-attempts"><summary>Provider details</summary>' in javascript
+    assert "OpenBB attempted:" in javascript
+    assert "NSE fallback attempted:" in javascript
+    assert "Live option-chain provider required" in javascript
+    assert "Connect live options provider" in javascript
+    assert "Import option-chain CSV for demo/research" in javascript
     assert "retry-banknifty" in javascript
     assert "No fake rows shown" in javascript
-    assert "provider not configured yet" not in javascript
+    assert "No fake option rows are generated." in javascript
 
 
 def test_openbb_empty_response_triggers_nse_fallback():
@@ -68,6 +69,7 @@ def test_openbb_empty_response_triggers_nse_fallback():
         response = client.get("/api/banknifty-options")
     assert response.status_code == 200
     assert response.json()["available"] is True
+    assert response.json()["provider_status"] == "connected"
     assert response.json()["source"] == "NSE fallback"
     assert response.json()["contracts"]
     fallback.assert_called_once_with(None)

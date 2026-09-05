@@ -130,8 +130,21 @@ def test_tradingagents_states_remain_independent():
         "installed": False,
         "configured": True,
         "ready": False,
-        "role": "multi-agent market decision",
+        "role": "optional advanced research layer",
     }
+
+
+def test_home_status_describes_architecture_and_shows_unconfigured_paperclip():
+    javascript = client.get("/assets/app.js").text
+    with patch.dict(os.environ, {}, clear=True):
+        status = integration_status()
+    assert status["paperclip"]["ready"] is False
+    assert status["paperclip"]["role"] == "optional control and audit bridge"
+    assert status["openbb"]["role"] == "market data and research layer"
+    assert status["tradingagents"]["role"] == "optional advanced research layer"
+    assert status["weex"]["role"] == "crypto venue and data source"
+    assert "item.enabled" not in javascript
+    assert "'Not configured'" in javascript
 
 
 def test_market_registry_is_exposed():
