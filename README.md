@@ -1,6 +1,11 @@
 # Signal — three-layer AI trading app
 
 An initial, functional **paper-trading** vertical slice built around the three requested projects.
+
+The Paper Trading dashboard at `/paper` persists its simulated account, positions,
+closed trades, watchlist, and journal in `data/signal.db`. It starts with 100,000
+USDT; set `PAPER_STARTING_CASH` before the database is first created to choose a
+different practice balance. This feature never sends orders to a broker or venue.
 The product model is market-agnostic: every run selects a market, venue, account mode and symbol.
 
 ## Start the app on macOS

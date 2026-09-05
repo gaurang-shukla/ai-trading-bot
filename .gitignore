@@ -8,3 +8,5 @@ __pycache__/
 .vscode/
 env
 ai-trading-bot-3.env
+data/*.db
+data/*.db-*
