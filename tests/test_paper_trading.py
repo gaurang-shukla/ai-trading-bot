@@ -62,9 +62,48 @@ def test_paper_routes_and_ui_are_present(tmp_path: Path, monkeypatch):
             "/api/paper/watchlist", "/api/paper/journal"} <= paths
     app_js = Path("src/tradebot/web/app.js").read_text()
     html = Path("src/tradebot/web/index.html").read_text()
-    assert "Open paper ${side}" in app_js
-    assert "Paper trading only — no real money is used." in app_js
+    assert "function paperTradeCopy(market,action)" in app_js
+    assert "Paper trading only. No real money is used." in app_js
     assert 'href="/paper"' in html and "PAPER MODE" in html
+
+
+@pytest.mark.parametrize(("market", "action", "button", "helper"), [
+    ("crypto_futures", "BUY", "Open paper LONG", "futures price goes up"),
+    ("crypto_futures", "SELL", "Open paper SHORT", "futures price goes down"),
+    ("equities", "BUY", "Buy paper shares", "Simulates buying shares"),
+    ("equities", "SELL", "Simulate paper short", "margin/borrowing"),
+    ("crypto_spot", "SELL", "Simulate bearish paper trade", "already owning the asset"),
+    ("forex", "BUY", "Buy base currency paper trade", "first currency in the pair"),
+    ("forex", "SELL", "Sell base currency paper trade", "first currency in the pair"),
+    ("banknifty_options", "BUY CE", "Buy paper Call option / Buy CE", "Call option (CE)"),
+    ("banknifty_options", "BUY PE", "Buy paper Put option / Buy PE", "Put option (PE)"),
+])
+def test_market_aware_paper_trade_copy_is_present(market, action, button, helper):
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    assert market in javascript
+    assert action in javascript
+    assert button in javascript
+    assert helper in javascript
+
+
+def test_hold_ui_offers_watchlist_without_an_open_trade_button():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    helper = javascript.split("function paperTradeCopy", 1)[1].split("function paperActions", 1)[0]
+    actions = javascript.split("function paperActions", 1)[1].split("function bindPaperActions", 1)[0]
+    assert "['HOLD','WATCH','AVOID']" in helper
+    assert "active:false,button:'Add to watchlist',helper:'No active trade setup'" in helper
+    assert "Add to watchlist instead" in actions
+    assert "copy.active?`<button id=\"open-paper\"" in actions
+
+
+def test_dashboard_explains_internal_sides_and_uses_friendly_labels():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    assert "LONG means the paper trade benefits if price rises" in javascript
+    assert "SHORT means it benefits if price falls" in javascript
+    assert "Paper shares" in javascript
+    assert "Simulated paper short" in javascript
+    assert "Paper futures ${side.toLowerCase()}" in javascript
+    assert "Internal side: ${safe(x.side)}" in javascript
 
 
 def test_hold_requires_force_and_buy_opens_long(tmp_path: Path, monkeypatch):
