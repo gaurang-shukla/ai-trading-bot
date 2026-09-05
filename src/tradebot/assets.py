@@ -45,9 +45,19 @@ FOREX = {
 
 _EQUITY_NAMES = {
     "HDFCBANK.NS": "HDFC Bank",
+    "ICICIBANK.NS": "ICICI Bank",
     "RELIANCE.NS": "Reliance",
     "INFY.NS": "Infosys",
     "SBIN.NS": "SBI",
+    "TCS.NS": "TCS",
+    "AXISBANK.NS": "Axis Bank",
+    "KOTAKBANK.NS": "Kotak Mahindra Bank",
+    "INDUSINDBK.NS": "IndusInd Bank",
+    "BANKBARODA.NS": "Bank of Baroda",
+    "PNB.NS": "Punjab National Bank",
+    "AUBANK.NS": "AU Small Finance Bank",
+    "IDFCFIRSTB.NS": "IDFC First Bank",
+    "FEDERALBNK.NS": "Federal Bank",
 }
 
 

@@ -53,6 +53,29 @@ def test_normalized_asset_identity_is_shared_across_market_surfaces():
     assert "paperAssetLink(x)" in APP_JS
 
 
+def test_clean_asset_names_cover_every_market_without_row_level_provider_noise():
+    from tradebot.assets import asset_metadata
+
+    expected = (
+        (MarketKind.CRYPTO_SPOT, "BTCUSDT", "BTC/USDT", "BTCUSDT"),
+        (MarketKind.CRYPTO_FUTURES, "ETHUSDT", "ETH/USDT", "ETHUSDT"),
+        (MarketKind.FOREX, "GBPUSD", "GBP/USD", "GBPUSD=X"),
+        (MarketKind.COMMODITIES, "NG", "Natural Gas", "NG=F"),
+        (MarketKind.EQUITIES, "NVDA", "NVDA", "NVDA"),
+        (MarketKind.EQUITIES, "SBIN.NS", "SBI", "SBIN.NS"),
+        (MarketKind.INDIAN_INDICES, "ICICIBANK.NS", "ICICI Bank", "ICICIBANK.NS"),
+    )
+    for market, symbol, display_name, provider_symbol in expected:
+        metadata = asset_metadata(market, symbol)
+        assert metadata.display_name == display_name
+        assert metadata.provider_symbol == provider_symbol
+
+    identity = APP_JS[APP_JS.index("function assetIdentity"):APP_JS.index("function paperAssetLink")]
+    assert "provider_symbol" not in identity
+    assert "instrument_type" not in identity
+    assert "<small>" not in identity
+
+
 def test_compact_refresh_control_sits_with_search_and_keeps_safety_states():
     assert 'class="search-row">${refreshControl' in APP_JS
     assert 'class="refresh-icon"' in APP_JS

@@ -144,20 +144,20 @@ def integration_status() -> dict:
             "installed": True,
             "configured": openbb_configured,
             "ready": openbb_configured,
-            "role": "normalized market research",
+            "role": "market data and research layer",
         },
         "tradingagents": {
             "installed": tradingagents_installed,
             "configured": tradingagents_configured,
             "ready": tradingagents_installed and tradingagents_configured,
-            "role": "multi-agent market decision",
+            "role": "optional advanced research layer",
         },
         "paperclip": {
             "installed": True,
             "configured": paperclip_configured,
             "ready": paperclip_configured,
             "enabled": paperclip.enabled or bool(os.getenv("PAPERCLIP_BRIDGE_TOKEN")),
-            "role": "audit and orchestration bridge",
+            "role": "optional control and audit bridge",
         },
         "weex": {
             "installed": True,
@@ -165,7 +165,7 @@ def integration_status() -> dict:
             "ready": True,
             "demo_credentials": all(os.getenv(key) for key in (
                 "WEEX_API_KEY", "WEEX_SECRET_KEY", "WEEX_PASSPHRASE")),
-            "role": "crypto prices and demo execution",
+            "role": "crypto venue and data source",
         },
     }
 
@@ -295,6 +295,8 @@ def create_app() -> FastAPI:
                         "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
                         "research_only": True, "provider_attempts": {"openbb": True, "nse_fallback": True},
                         "failure_category": category, "explanation": _banknifty_explanation(category),
+                        "provider_status": ("not_configured" if category == "not_configured"
+                                            else "temporarily_unavailable"),
                         "last_checked": datetime.now(timezone.utc).isoformat(),
                         "setup_note": "A reliable options data provider is required for production Bank Nifty option-chain coverage."}
                 if _debug_enabled():
@@ -304,6 +306,7 @@ def create_app() -> FastAPI:
         result = build_chain(raw, spot, expiry, option_type, moneyness)
         # Filters may legitimately select no contracts while the provider remains available.
         result["available"] = True
+        result["provider_status"] = "connected"
         return result
 
     @app.get("/api/markets")
