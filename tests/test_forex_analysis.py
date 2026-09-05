@@ -92,11 +92,11 @@ def test_forex_overview_uses_the_same_metadata_mapping():
 
 def test_frontend_formats_forex_prices_volume_and_market_aware_surfaces():
     javascript = Path("src/tradebot/web/app.js").read_text()
-    assert "symbol.toUpperCase().includes('JPY')?2:4" in javascript
-    assert "symbol.toUpperCase().includes('JPY')?3:5" in javascript
+    assert "function adaptivePriceDigits(value)" in javascript
+    assert "maximumSignificantDigits:10" in javascript
     assert "market==='forex'&&Number(value)===0" in javascript
     assert "Volume not reported" in javascript
-    assert "priceFormat:chartPriceFormat()" in javascript
+    assert "priceFormat:chartPriceFormat(candles.at(-1)?.close??data.live_price)" in javascript
     assert "${price(level.price)}" in javascript
     assert "${price(plan.stop_loss,market,symbol)}" in javascript
     assert "if(market==='forex')return side==='LONG'?'Buy base currency paper trade':'Sell base currency paper trade'" in javascript

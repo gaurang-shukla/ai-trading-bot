@@ -92,7 +92,7 @@ def test_hold_ui_offers_watchlist_without_an_open_trade_button():
     actions = javascript.split("function paperActions", 1)[1].split("function bindPaperActions", 1)[0]
     assert "['HOLD','WATCH','AVOID']" in helper
     assert "active:false,button:'Add to watchlist',helper:'No active trade setup'" in helper
-    assert "Add to watchlist instead" in actions
+    assert "No active trade setup — watch support/resistance for confirmation." in actions
     assert "copy.active?`<button id=\"open-paper\"" in actions
 
 
