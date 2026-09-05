@@ -3,6 +3,7 @@ from decimal import Decimal
 from unittest.mock import patch
 from tradebot.models import Side
 from tradebot.weex import FuturesOrder, WeexCredentials, WeexDemoFuturesBroker, WeexV3Transport, live_execution_enabled
+from tradebot.adapters import normalize_weex_24h_change
 
 class MemoryLedger:
     def __init__(self): self.ids = set()
@@ -23,6 +24,10 @@ def an_order(exit_only=False):
                         Decimal("60000"), Decimal("70000"), exit_only)
 
 class WeexDemoTests(unittest.TestCase):
+    def test_weex_change_formats_include_bulla_high_mover(self):
+        self.assertAlmostEqual(normalize_weex_24h_change({"changeRate": 2.0535}), 205.35)
+        self.assertAlmostEqual(normalize_weex_24h_change({"priceChangePercent": 205.35}), 205.35)
+        self.assertAlmostEqual(normalize_weex_24h_change({"priceChangePercent": "205.35%"}), 205.35)
     def test_signature_matches_spec_formula(self):
         transport = WeexV3Transport(WeexCredentials("key", "secret", "pass"))
         body = '{"symbol":"BTCSUSDT"}'

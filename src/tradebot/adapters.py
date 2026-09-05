@@ -24,6 +24,25 @@ INDIAN_RESEARCH_SYMBOLS = {
 logger = logging.getLogger(__name__)
 
 
+def normalize_weex_24h_change(row: dict) -> float | None:
+    """Normalize WEEX's field-specific 24-hour change formats to percentage points.
+
+    WEEX ``changeRate`` is a ratio (2.0535 means 205.35%), whereas
+    ``priceChangePercent`` is already expressed in percentage points.  A literal
+    percent suffix is unambiguous regardless of which field supplied it.
+    """
+    if row.get("changeRate") is not None:
+        raw, ratio = row["changeRate"], True
+    elif row.get("priceChangePercent") is not None:
+        raw, ratio = row["priceChangePercent"], False
+    else:
+        return None
+    if isinstance(raw, str) and raw.strip().endswith("%"):
+        raw, ratio = raw.strip()[:-1], False
+    value = _optional_float(raw)
+    return value * 100 if value is not None and ratio else value
+
+
 def research_symbol(symbol: str) -> str:
     """Translate an exchange crypto pair into the format used by research feeds."""
     value = symbol.upper().replace("/", "").replace(":", "")
@@ -224,7 +243,7 @@ class WeexSpotMarketData(_WeexPublicClient):
         row = payload[0] if isinstance(payload, list) else payload
         return MarketSnapshot(symbol.upper(), float(row["lastPrice"]),
                               self._timestamp(row.get("closeTime")), "weex_spot_v3",
-                              _optional_float(row.get("priceChangePercent") or row.get("changeRate")),
+                              normalize_weex_24h_change(row),
                               _optional_float(row.get("quoteVolume") or row.get("volume")), None,
                               _ticker_volatility(row))
 
@@ -247,7 +266,7 @@ class WeexFuturesMarketData(_WeexPublicClient):
         price = row.get("lastPrice") or row.get("last") or row.get("markPrice") or row.get("price")
         return MarketSnapshot(symbol.upper(), float(price),
                               self._timestamp(row.get("closeTime") or row.get("time")), "weex_futures_v3",
-                              _optional_float(row.get("priceChangePercent") or row.get("changeRate")),
+                              normalize_weex_24h_change(row),
                               _optional_float(row.get("quoteVolume") or row.get("volume")),
                               _optional_float(row.get("fundingRate") or row.get("lastFundingRate")),
                               _ticker_volatility(row))
