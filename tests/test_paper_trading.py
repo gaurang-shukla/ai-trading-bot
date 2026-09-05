@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -81,3 +82,73 @@ def test_hold_requires_force_and_buy_opens_long(tmp_path: Path, monkeypatch):
                                                           "notional_amount": 500})
     assert response.status_code == 201
     assert response.json()["side"] == "LONG"
+
+
+def test_paper_frontend_requests_use_valid_fetch_init_objects():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+
+    # Passing getJSON directly to map supplied Array.map's numeric index as
+    # fetch's RequestInit argument, which browsers reject with a TypeError.
+    assert ".map(getJSON)" not in javascript
+    assert ".map(url=>getJSON(url))" in javascript
+    assert "async function getJSON(url, options={})" in javascript
+    assert "async function postJSON(url,payload)" in javascript
+    assert "method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)" in javascript
+    assert "postJSON('/api/paper/positions',{market,symbol,side,notional_amount:Number(input.value)})" in javascript
+    assert "postJSON(`/api/paper/positions/${b.dataset.id}/close`,{close_reason:'Closed from dashboard'})" in javascript
+    assert "deleteJSON(`/api/paper/watchlist/${b.dataset.market}/${encodeURIComponent(b.dataset.symbol)}`)" in javascript
+    assert "async function deleteJSON(url){return getJSON(url,{method:'DELETE'});}" in javascript
+
+
+def test_paper_dashboard_has_specific_redacted_error_state():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    paper_error = javascript.split("function paperErrorView", 1)[1].split("async function home", 1)[0]
+    paper_page = javascript.split("async function paperPage", 1)[1].split("function paperPositionTable", 1)[0]
+
+    assert "We couldn’t load Paper Trading" in paper_error
+    assert "Paper Trading is local-only. Please refresh or restart the app." in paper_error
+    assert "We couldn’t load this market" not in paper_error
+    assert "error.message" not in paper_error
+    assert "catch(error){paperErrorView(error)}" in paper_page
+
+
+def test_all_paper_api_routes_support_the_dashboard_flow(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SIGNAL_DB_PATH", str(tmp_path / "dashboard.db"))
+    provider = Mock(snapshot=Mock(return_value=Mock(price=110)))
+    registry = Mock(market_data=Mock(return_value=provider))
+    monkeypatch.setattr("tradebot.app.default_registry", lambda: registry)
+    client = TestClient(create_app())
+    quick_results.put("equities", "FLOWTEST", {
+        "live_price": 100,
+        "display_name": "Flow Test",
+        "signal": {"side": Side.BUY, "confidence": .8},
+        "risk_plan": {"stop_loss": 90, "take_profit": 120, "risk_score": .2,
+                      "position_size_pct": .01},
+    })
+
+    assert client.get("/paper").status_code == 200
+    assert client.get("/api/paper/account").status_code == 200
+    assert client.get("/api/paper/positions").json() == []
+    opened = client.post("/api/paper/positions", json={
+        "market": "equities", "symbol": "FLOWTEST", "notional_amount": 1_000,
+    })
+    assert opened.status_code == 201
+    position_id = opened.json()["id"]
+    assert len(client.get("/api/paper/positions").json()) == 1
+
+    closed = client.post(f"/api/paper/positions/{position_id}/close", json={
+        "close_reason": "Dashboard test",
+    })
+    assert closed.status_code == 200
+    assert len(client.get("/api/paper/trades").json()) == 1
+
+    watched = client.post("/api/paper/watchlist", json={
+        "market": "equities", "symbol": "FLOWTEST", "display_name": "Flow Test",
+    })
+    assert watched.status_code == 201
+    assert len(client.get("/api/paper/watchlist").json()) == 1
+    assert client.delete("/api/paper/watchlist/equities/FLOWTEST").status_code == 204
+
+    note = client.post("/api/paper/journal", json={"note": "Review the setup", "symbol": "FLOWTEST"})
+    assert note.status_code == 201
+    assert len(client.get("/api/paper/journal").json()) == 1
