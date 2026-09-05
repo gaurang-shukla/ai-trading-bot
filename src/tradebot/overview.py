@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from statistics import mean
 
@@ -209,16 +210,40 @@ class CachedMarketOverview:
         self.ttl_seconds = ttl_seconds if ttl_seconds is not None else float(os.getenv("MARKET_CACHE_TTL_SECONDS", "60"))
         self._values: dict[MarketKind, tuple[float, dict]] = {}
         self._lock = threading.Lock()
+        self._refreshing: dict[MarketKind, threading.Event] = {}
+        self.refresh_cooldown_seconds = float(os.getenv("MARKET_REFRESH_COOLDOWN_SECONDS", "30"))
 
-    def get(self, market: MarketKind) -> dict:
+    def get(self, market: MarketKind, refresh: bool = False) -> dict:
         now = time.monotonic()
         with self._lock:
             cached = self._values.get(market)
-            if cached and now - cached[0] < self.ttl_seconds:
+            if cached and now - cached[0] < (self.refresh_cooldown_seconds if refresh else self.ttl_seconds):
                 return cached[1]
-        result = MarketOverviewService().build(market)
+            pending = self._refreshing.get(market)
+            if pending is None:
+                pending = self._refreshing[market] = threading.Event()
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            pending.wait()
+            with self._lock:
+                return self._values[market][1]
+        try:
+            result = MarketOverviewService().build(market)
+            result["last_updated"] = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            with self._lock:
+                cached = self._values.get(market)
+            if not cached:
+                with self._lock:
+                    self._refreshing.pop(market).set()
+                raise
+            result = dict(cached[1])
+            result["warning"] = "Couldn’t refresh right now. Showing last available data."
         with self._lock:
             self._values[market] = (now, result)
+            self._refreshing.pop(market).set()
         return result
 
 
@@ -229,5 +254,5 @@ def crypto_overview(market: MarketKind) -> dict:
     return MarketOverviewService().build(market)
 
 
-def market_overview(market: MarketKind) -> dict:
-    return _overviews.get(market)
+def market_overview(market: MarketKind, refresh: bool = False) -> dict:
+    return _overviews.get(market, refresh=refresh)
