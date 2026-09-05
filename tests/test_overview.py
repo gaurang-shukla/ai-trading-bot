@@ -2,7 +2,7 @@ from unittest.mock import patch
 
 from tradebot.models import MarketKind
 from tradebot.models import MarketSnapshot
-from tradebot.overview import MarketOverviewService, crypto_overview
+from tradebot.overview import CachedMarketOverview, MarketOverviewService, crypto_overview
 
 
 def test_crypto_overview_ranks_real_ticker_fields():
@@ -49,3 +49,28 @@ def test_all_provider_failures_return_stable_dashboard(monkeypatch):
     result = MarketOverviewService().build(MarketKind.EQUITIES)
     assert result["warning"] == "Live market data is temporarily unavailable."
     assert result["assets"][0]["symbol"] == "AAPL"
+
+
+def test_manual_refresh_obeys_cooldown_and_returns_last_updated(monkeypatch):
+    builds = []
+    monkeypatch.setattr(MarketOverviewService, "build", lambda self, market:
+                        builds.append(market) or {"market": market.value, "assets": []})
+    overview = CachedMarketOverview(ttl_seconds=60)
+    first = overview.get(MarketKind.EQUITIES)
+    second = overview.get(MarketKind.EQUITIES, refresh=True)
+    assert second is first
+    assert len(builds) == 1
+    assert first["last_updated"].endswith("+00:00")
+
+
+def test_failed_manual_refresh_keeps_last_known_data(monkeypatch):
+    overview = CachedMarketOverview(ttl_seconds=0)
+    overview.refresh_cooldown_seconds = 0
+    monkeypatch.setattr(MarketOverviewService, "build", lambda self, market:
+                        {"market": market.value, "assets": [{"symbol": "AAPL"}]})
+    original = overview.get(MarketKind.EQUITIES)
+    monkeypatch.setattr(MarketOverviewService, "build", lambda self, market:
+                        (_ for _ in ()).throw(ConnectionError("provider secret")))
+    stale = overview.get(MarketKind.EQUITIES, refresh=True)
+    assert stale["assets"] == original["assets"]
+    assert stale["warning"] == "Couldn’t refresh right now. Showing last available data."

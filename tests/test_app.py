@@ -9,6 +9,7 @@ from tradebot.adapters import PaperclipReporter
 from tradebot.app import app, integration_status, startup_diagnostics
 from tradebot.config import load_project_env
 from tradebot.diagnostics import diagnostics
+from tradebot.models import MarketKind
 from tradebot.weex import WeexCredentials
 
 
@@ -160,3 +161,21 @@ def test_non_crypto_overview_exposes_real_universe_without_fake_quotes():
     body = response.json()
     assert body["source"] == "OpenBB"
     assert body["assets"][0]["price"] == 100
+
+
+def test_overview_api_forwards_manual_refresh_flag():
+    with patch("tradebot.app.market_overview", return_value={"last_updated": "now"}) as overview:
+        response = client.get("/api/overview/equities?refresh=true")
+    assert response.status_code == 200
+    overview.assert_called_once_with(MarketKind.EQUITIES, refresh=True)
+
+
+def test_market_and_ranking_pages_include_one_shared_refresh_control():
+    script = client.get("/assets/app.js").text
+    assert "Refresh market" in script
+    assert "Refresh rankings" in script
+    assert "Last updated:" in script
+    assert "?refresh=true" in script
+    assert "Refreshing…" in script
+    assert "Refresh available in ${remaining}s" in script
+    assert "Couldn’t refresh right now. Showing last available data." in script

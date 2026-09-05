@@ -315,9 +315,9 @@ def create_app() -> FastAPI:
         return public_metadata(market, symbol)
 
     @app.get("/api/overview/{market}")
-    def overview(market: MarketKind):
+    def overview(market: MarketKind, refresh: bool = False):
         try:
-            return market_overview(market)
+            return market_overview(market, refresh=refresh)
         except Exception as exc:
             raise _provider_error("Market data is temporarily unavailable. Try again later.", exc) from exc
 
