@@ -128,6 +128,15 @@ class PaperStore:
         """
         with self._lock, self._database() as db:
             db.executescript(schema)
+            # Additive migrations keep existing local paper portfolios intact.
+            position_columns = {row[1] for row in db.execute("PRAGMA table_info(paper_positions)")}
+            if "price_available" not in position_columns:
+                db.execute("ALTER TABLE paper_positions ADD COLUMN price_available INTEGER NOT NULL DEFAULT 1")
+            trade_columns = {row[1] for row in db.execute("PRAGMA table_info(paper_trades)")}
+            if "entry_notional" not in trade_columns:
+                db.execute("ALTER TABLE paper_trades ADD COLUMN entry_notional REAL")
+            if "exit_value" not in trade_columns:
+                db.execute("ALTER TABLE paper_trades ADD COLUMN exit_value REAL")
             db.execute("INSERT OR IGNORE INTO paper_account VALUES (1,?,?,0)",
                        (self.starting_cash, self.starting_cash))
             db.execute("PRAGMA user_version=1")
@@ -155,12 +164,47 @@ class PaperStore:
         profit = self.pnl(item["side"], item["entry_price"], item["current_price"], item["quantity"])
         item["unrealized_pnl"] = profit
         item["unrealized_pnl_pct"] = profit / item["notional_value"] * 100
+        item["entry_notional"] = item["notional_value"]
+        item["amount_invested"] = item["notional_value"]
+        item["current_value"] = item["notional_value"] + profit
+        item["allocated_pct"] = item["notional_value"] / self.starting_cash * 100
+        item["position_status"] = self.position_status(item)
         return item
+
+    @staticmethod
+    def trigger_reason(position: dict[str, Any]) -> str | None:
+        """Return the paper exit trigger crossed by the last real provider mark."""
+        current, stop, target = position.get("current_price"), position.get("stop_loss"), position.get("take_profit")
+        if current is None:
+            return None
+        if position["side"] == "LONG":
+            if stop is not None and current <= stop:
+                return "stop_loss"
+            if target is not None and current >= target:
+                return "take_profit"
+        else:
+            if stop is not None and current >= stop:
+                return "stop_loss"
+            if target is not None and current <= target:
+                return "take_profit"
+        return None
+
+    @classmethod
+    def position_status(cls, position: dict[str, Any]) -> str:
+        if not bool(position.get("price_available", True)):
+            return "Price unavailable"
+        return {"stop_loss": "Stop loss breached", "take_profit": "Take profit reached"}.get(
+            cls.trigger_reason(position), "Active")
 
     def mark(self, position_id: str, price: float) -> None:
         price = _positive_number(price, "Current price")
         with self._lock, self._database() as db:
-            db.execute("UPDATE paper_positions SET current_price=? WHERE id=? AND status='open'", (price, position_id))
+            db.execute("UPDATE paper_positions SET current_price=?,price_available=1 WHERE id=? AND status='open'", (price, position_id))
+
+    def mark_unavailable(self, position_id: str) -> None:
+        """Retain the last valid price while making its stale/unavailable state explicit."""
+        with self._lock, self._database() as db:
+            db.execute("UPDATE paper_positions SET price_available=0 WHERE id=? AND status='open'", (position_id,))
 
     def account(self) -> dict[str, Any]:
         positions = self.positions()
@@ -168,8 +212,10 @@ class PaperStore:
         with self._database() as db:
             account = dict(db.execute("SELECT * FROM paper_account WHERE id=1").fetchone())
             count, wins = db.execute("SELECT COUNT(*), COALESCE(SUM(realized_pnl>0),0) FROM paper_trades").fetchone()
-        equity = account["cash_balance"] + sum(x["notional_value"] for x in positions) + unrealized
+        capital = sum(x["notional_value"] for x in positions)
+        equity = account["cash_balance"] + sum(x["current_value"] for x in positions)
         return {"starting_balance": account["starting_balance"], "cash_balance": account["cash_balance"],
+                "available_paper_cash": account["cash_balance"], "capital_in_open_trades": capital,
                 "equity": equity, "realized_pnl": account["realized_pnl"], "unrealized_pnl": unrealized,
                 "total_pnl": account["realized_pnl"] + unrealized,
                 "win_rate": (wins / count * 100 if count else 0), "open_positions_count": len(positions),
@@ -213,11 +259,13 @@ class PaperStore:
         position_id = item["id"]
         return next(position for position in self.positions() if position["id"] == position_id)
 
-    def close_position(self, position_id: str, price: float, reason: str = "Closed by user") -> dict:
+    def close_position(self, position_id: str, price: float, reason: str = "manual") -> dict:
         price = _positive_number(price, "Live price")
         if not isinstance(reason, str):
             raise ValueError("Close reason must be text")
-        reason = reason.strip()[:200] or "Closed by user"
+        reason = reason.strip().lower()
+        if reason not in {"stop_loss", "take_profit", "manual"}:
+            reason = "manual"
         with self._lock, self._database() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM paper_positions WHERE id=? AND status='open'", (position_id,)).fetchone()
@@ -230,7 +278,9 @@ class PaperStore:
                      "exit_price": price, "quantity": position["quantity"], "realized_pnl": profit,
                      "realized_pnl_pct": profit / position["notional_value"] * 100,
                      "opened_at": position["opened_at"], "closed_at": _now(),
-                     "close_reason": reason, "signal_snapshot": position["signal_snapshot"]}
+                     "close_reason": reason, "signal_snapshot": position["signal_snapshot"],
+                     "entry_notional": position["notional_value"],
+                     "exit_value": position["notional_value"] + profit}
             db.execute("UPDATE paper_positions SET status='closed',current_price=? WHERE id=?", (price, position_id))
             db.execute("UPDATE paper_account SET cash_balance=cash_balance+?, realized_pnl=realized_pnl+? WHERE id=1",
                        (position["notional_value"] + profit, profit))
@@ -253,6 +303,13 @@ class PaperStore:
             except (TypeError, json.JSONDecodeError):
                 item["signal_snapshot"] = {}
             item["result"] = "win" if item["realized_pnl"] > 0 else "loss" if item["realized_pnl"] < 0 else "breakeven"
+            # Older rows remain useful after the additive migration.
+            item["entry_notional"] = item.get("entry_notional") or item["entry_price"] * item["quantity"]
+            item["exit_value"] = item.get("exit_value") or item["exit_price"] * item["quantity"]
+            item["amount_invested"] = item["entry_notional"]
+            item["position_status"] = {"stop_loss": "Closed by stop loss",
+                                       "take_profit": "Closed by take profit",
+                                       "manual": "Closed manually"}.get(item["close_reason"], "Closed manually")
             result.append(item)
         return result
 

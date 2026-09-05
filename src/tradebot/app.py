@@ -557,9 +557,18 @@ def create_app() -> FastAPI:
         for position in paper.positions():
             try:
                 paper.mark(position["id"], _paper_quote(position["market"], position["symbol"]))
-            except Exception:
-                # Preserve the last valid mark when a provider is temporarily unavailable.
+                marked = next((item for item in paper.positions() if item["id"] == position["id"]), None)
+                reason = paper.trigger_reason(marked) if marked else None
+                auto_close = os.getenv("PAPER_AUTO_CLOSE_STOPS", "true").strip().lower() not in {"0", "false", "no", "off"}
+                if reason and auto_close:
+                    paper.close_position(position["id"], marked[reason], reason)
+            except KeyError:
+                # Another simultaneous dashboard request already closed this position.
                 pass
+            except Exception as exc:
+                # Preserve the last valid mark when a provider is temporarily unavailable.
+                paper.mark_unavailable(position["id"])
+                diagnostics.failure("paper_quote", exc)
         return paper.positions()
 
     @app.get("/api/paper/account")
@@ -614,7 +623,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "Open paper position not found")
         try:
             quote_price = _paper_quote(position["market"], position["symbol"])
-            return paper.close_position(position_id, quote_price, request.close_reason)
+            return paper.close_position(position_id, quote_price, "manual")
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         except KeyError as exc:

@@ -134,7 +134,7 @@ def test_paper_frontend_requests_use_valid_fetch_init_objects():
     assert "async function postJSON(url,payload)" in javascript
     assert "method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)" in javascript
     assert "postJSON('/api/paper/positions',{market,symbol,side,notional_amount:Number(input.value)})" in javascript
-    assert "postJSON(`/api/paper/positions/${b.dataset.id}/close`,{close_reason:'Closed from dashboard'})" in javascript
+    assert "postJSON(`/api/paper/positions/${b.dataset.id}/close`,{close_reason:'manual'})" in javascript
     assert "deleteJSON(`/api/paper/watchlist/${b.dataset.market}/${encodeURIComponent(b.dataset.symbol)}`)" in javascript
     assert "async function deleteJSON(url){return getJSON(url,{method:'DELETE'});}" in javascript
 
@@ -207,7 +207,7 @@ def test_close_button_stops_navigation_and_quantity_is_bounded():
     javascript = Path("src/tradebot/web/app.js").read_text()
     close_handler = javascript.split("document.querySelectorAll('.close-paper')", 1)[1].split("document.querySelectorAll('.remove-watch')", 1)[0]
     assert "event.preventDefault();event.stopPropagation()" in close_handler
-    assert "<td>${quantity(x.quantity)}</td>" in javascript
+    assert "Qty ${quantity(x.quantity)}" in javascript
     assert "Math.abs(n)>=1?4:Math.abs(n)>=.001?6:8" in javascript
 
 
@@ -324,3 +324,85 @@ def test_separate_stores_serialize_cash_reservations(tmp_path: Path):
         results = list(executor.map(attempt, range(2)))
     assert sum(result is not None for result in results) == 1
     assert PaperStore(path).account()["cash_balance"] == 250
+
+
+@pytest.mark.parametrize(("side", "mark", "reason"), [
+    ("LONG", 90, "stop_loss"), ("LONG", 120, "take_profit"),
+    ("SHORT", 110, "stop_loss"), ("SHORT", 80, "take_profit"),
+])
+def test_paper_trigger_boundaries(side, mark, reason, tmp_path: Path):
+    store = PaperStore(tmp_path / f"trigger-{side}-{reason}.db")
+    position = open_trade(store, side)
+    store.mark(position["id"], mark)
+    marked = store.positions()[0]
+    assert store.trigger_reason(marked) == reason
+    assert marked["position_status"] != "Active"
+
+
+def test_position_values_account_capital_and_closed_values(tmp_path: Path):
+    store = PaperStore(tmp_path / "values.db", starting_cash=10_000)
+    position = open_trade(store, notional=1_000)
+    store.mark(position["id"], 110)
+    position = store.positions()[0]
+    assert position["entry_notional"] == position["amount_invested"] == 1_000
+    assert position["current_value"] == pytest.approx(1_100)
+    assert position["allocated_pct"] == 10
+    account = store.account()
+    assert account["available_paper_cash"] == 9_000
+    assert account["capital_in_open_trades"] == 1_000
+    assert account["equity"] == 10_100
+    trade = store.close_position(position["id"], 110, "manual")
+    assert trade["entry_notional"] == 1_000
+    assert trade["exit_value"] == pytest.approx(1_100)
+    assert store.trades()[0]["position_status"] == "Closed manually"
+
+
+def test_unavailable_mark_retains_price_and_is_visible(tmp_path: Path):
+    store = PaperStore(tmp_path / "unavailable.db")
+    position = open_trade(store)
+    store.mark(position["id"], 105)
+    store.mark_unavailable(position["id"])
+    marked = store.positions()[0]
+    assert marked["current_price"] == 105
+    assert marked["position_status"] == "Price unavailable"
+
+
+def test_dashboard_names_capital_and_status_fields():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    assert "Available paper cash" in javascript
+    assert "Capital in open trades" in javascript
+    assert "<th>Amount invested</th>" in javascript
+    assert "position_status" in javascript
+    assert "['Cash balance'" not in javascript
+
+
+@pytest.mark.parametrize(("mark", "reason", "exit_price"), [
+    (80, "stop_loss", 90), (130, "take_profit", 120),
+])
+def test_account_refresh_auto_closes_trigger_once(mark, reason, exit_price, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SIGNAL_DB_PATH", str(tmp_path / f"auto-{reason}.db"))
+    monkeypatch.setenv("PAPER_AUTO_CLOSE_STOPS", "true")
+    provider = Mock(snapshot=Mock(return_value=Mock(price=mark)))
+    monkeypatch.setattr("tradebot.app.default_registry", lambda: Mock(market_data=Mock(return_value=provider)))
+    client = TestClient(create_app())
+    store = client.app.state.paper_store
+    open_trade(store)
+
+    assert client.get("/api/paper/account").status_code == 200
+    assert client.get("/api/paper/account").status_code == 200
+    trades = store.trades()
+    assert len(trades) == 1
+    assert trades[0]["close_reason"] == reason
+    assert trades[0]["exit_price"] == exit_price
+
+
+def test_disabled_auto_close_keeps_breach_with_warning(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SIGNAL_DB_PATH", str(tmp_path / "disabled-auto.db"))
+    monkeypatch.setenv("PAPER_AUTO_CLOSE_STOPS", "false")
+    provider = Mock(snapshot=Mock(return_value=Mock(price=90)))
+    monkeypatch.setattr("tradebot.app.default_registry", lambda: Mock(market_data=Mock(return_value=provider)))
+    client = TestClient(create_app())
+    open_trade(client.app.state.paper_store)
+    positions = client.get("/api/paper/positions").json()
+    assert len(positions) == 1
+    assert positions[0]["position_status"] == "Stop loss breached"
