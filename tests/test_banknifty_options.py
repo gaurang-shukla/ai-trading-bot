@@ -35,31 +35,32 @@ def test_unavailable_provider_state_does_not_crash_or_return_fake_rows():
     assert response.json()["contracts"] == []
     assert response.json()["available"] is False
     assert response.json()["provider_attempts"] == {"openbb": True, "nse_fallback": True}
-    assert response.json()["failure_category"] == "provider_unavailable"
-    assert response.json()["provider_status"] == "temporarily_unavailable"
+    assert response.json()["failure_category"] == "nse_http_error"
+    assert response.json()["provider_status"] == "nse_http_error"
     assert "provider_errors" not in response.json()
 
 
-def test_banknifty_raw_provider_errors_require_debug(monkeypatch):
+def test_banknifty_provider_errors_are_sanitized_in_debug(monkeypatch):
     monkeypatch.setenv("SIGNAL_DEBUG", "true")
     with (patch("tradebot.app.OpenBBClient.option_chain", side_effect=RuntimeError("private openbb detail")),
           patch("tradebot.app.NSEOptionChainClient.option_chain", side_effect=RuntimeError("private nse detail"))):
         payload = client.get("/api/banknifty-options").json()
-    assert "private openbb detail" in payload["provider_errors"]["openbb"]
-    assert "private nse detail" in payload["provider_errors"]["nse_fallback"]
+    assert "provider_errors" not in payload
+    text = str(payload["provider_diagnostics"])
+    assert "private openbb detail" not in text
+    assert "private nse detail" not in text
 
 
 def test_banknifty_ui_keeps_attempt_metadata_in_compact_details():
     javascript = client.get("/assets/app.js").text
-    assert '<details class="provider-attempts"><summary>Provider details</summary>' in javascript
-    assert "OpenBB attempted:" in javascript
-    assert "NSE fallback attempted:" in javascript
+    assert '<details class="provider-attempts"><summary>Provider diagnostics</summary>' in javascript
+    assert "data.provider_diagnostics?" in javascript
     assert "Live option-chain provider required" in javascript
     assert "Connect live options provider" in javascript
     assert "Import option-chain CSV for demo/research" in javascript
     assert "retry-banknifty" in javascript
     assert "No fake rows shown" in javascript
-    assert "No fake option rows are generated." in javascript
+    assert "No fake rows are generated." in javascript
 
 
 def test_openbb_empty_response_triggers_nse_fallback():
@@ -82,8 +83,13 @@ def test_nse_response_normalizes_to_option_contract(monkeypatch):
                "openInterest": 1000, "impliedVolatility": 18, "bidprice": 199,
                "askPrice": 201}}]}}
     client_instance = NSEOptionChainClient(retries=0)
-    responses = iter([{}, payload])
-    monkeypatch.setattr(client_instance, "_open_json", lambda *args, **kwargs: next(responses))
+    initial = Mock(status_code=200, url="https://www.nseindia.com/", headers={})
+    initial.raise_for_status = Mock()
+    response = Mock(status_code=200, url="https://www.nseindia.com/api/option-chain-indices?symbol=BANKNIFTY",
+                    headers={"content-type": "application/json"})
+    response.raise_for_status = Mock()
+    response.json.return_value = payload
+    client_instance.session.get = Mock(side_effect=[initial, response])
     raw = client_instance.option_chain()
     result = build_chain(raw, raw["underlying_price"])
     contract = result["contracts"][0]
@@ -142,7 +148,60 @@ def test_empty_provider_attempts_are_distinguished_without_fabricated_rows():
     with (patch("tradebot.app.OpenBBClient.option_chain", return_value={"contracts": []}),
           patch("tradebot.app.NSEOptionChainClient.option_chain", return_value={"contracts": [], "underlying_price": None})):
         payload = client.get("/api/banknifty-options").json()
-    assert payload["failure_category"] == "provider_returned_empty"
-    assert "no valid option-chain rows" in payload["explanation"]
+    assert payload["failure_category"] == "nse_empty_chain"
+    assert "valid option chain could not be retrieved" in payload["explanation"]
     assert payload["provider_attempts"] == {"openbb": True, "nse_fallback": True}
     assert payload["contracts"] == []
+
+
+def _response(status=200, payload=None, content_type="application/json"):
+    response = Mock(status_code=status, url="https://www.nseindia.com/api/option-chain-indices?symbol=BANKNIFTY",
+                    headers={"content-type": content_type})
+    response.raise_for_status = Mock()
+    if payload is None:
+        response.json.side_effect = ValueError("not json")
+    else:
+        response.json.return_value = payload
+    return response
+
+
+def test_openbb_connection_refused_has_precise_category():
+    from tradebot.banknifty_options import classify_openbb_failure
+    assert classify_openbb_failure(ConnectionRefusedError(61, "Connection refused")) == "openbb_connection_refused"
+
+
+def test_nse_block_statuses_are_precisely_classified():
+    for status in (401, 403, 429):
+        nse = NSEOptionChainClient(retries=0)
+        nse.session.get = Mock(return_value=_response(status, {}))
+        try:
+            nse.option_chain()
+        except Exception as exc:
+            assert exc.category == "nse_blocked_by_provider"
+
+
+def test_nse_html_and_empty_json_have_precise_categories():
+    initial = _response(200, {})
+    initial.url = "https://www.nseindia.com/"
+    for response, expected in [(_response(200, None, "text/html"), "nse_html_instead_of_json"),
+                               (_response(200, {"records": {"data": []}}), "nse_empty_chain")]:
+        nse = NSEOptionChainClient(retries=0)
+        nse.session.get = Mock(side_effect=[initial, response])
+        try:
+            nse.option_chain()
+        except Exception as exc:
+            assert exc.category == expected
+
+
+def test_diagnostics_are_hidden_unless_debug_enabled(monkeypatch):
+    monkeypatch.delenv("SIGNAL_DEBUG", raising=False)
+    with (patch("tradebot.app.OpenBBClient.option_chain", side_effect=ConnectionRefusedError()),
+          patch("tradebot.app.NSEOptionChainClient.option_chain", side_effect=RuntimeError("down"))):
+        assert "provider_diagnostics" not in client.get("/api/banknifty-options").json()
+    monkeypatch.setenv("SIGNAL_DEBUG", "true")
+    with (patch("tradebot.app.OpenBBClient.option_chain", side_effect=ConnectionRefusedError()),
+          patch("tradebot.app.NSEOptionChainClient.option_chain", side_effect=RuntimeError("down"))):
+        diagnostics = client.get("/api/banknifty-options").json()["provider_diagnostics"]
+    assert set(diagnostics[0]) >= {"provider", "attempted", "status_code", "final_url", "content_type",
+                                  "got_json", "raw_row_count", "ce_count", "pe_count",
+                                  "normalized_contract_count", "failure_category", "sanitized_error"}
