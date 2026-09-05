@@ -29,11 +29,13 @@ def test_unavailable_provider_state_does_not_crash_or_return_fake_rows():
           patch("tradebot.app.NSEOptionChainClient.option_chain", side_effect=RuntimeError("blocked"))):
         response = client.get("/api/banknifty-options")
     assert response.status_code == 200
-    assert response.json()["message"] == "Bank Nifty options data provider not configured yet."
+    assert response.json()["message"] == "Real Bank Nifty option-chain data is temporarily unavailable."
+    assert response.json()["explanation"]
+    assert response.json()["last_checked"]
     assert response.json()["contracts"] == []
     assert response.json()["available"] is False
     assert response.json()["provider_attempts"] == {"openbb": True, "nse_fallback": True}
-    assert response.json()["failure_category"] == "blocked by data source"
+    assert response.json()["failure_category"] == "provider_unavailable"
     assert "provider_errors" not in response.json()
 
 
@@ -51,6 +53,10 @@ def test_banknifty_ui_renders_attempt_metadata():
     assert "OpenBB tried:" in javascript
     assert "NSE fallback tried:" in javascript
     assert "Failure category:" in javascript
+    assert "Bank Nifty options data unavailable" in javascript
+    assert "retry-banknifty" in javascript
+    assert "No fake rows shown" in javascript
+    assert "provider not configured yet" not in javascript
 
 
 def test_openbb_empty_response_triggers_nse_fallback():
@@ -126,3 +132,13 @@ def test_indian_deep_ai_missing_ohlcv_has_clean_fallback():
     assert result["fallback_result"]["signal"]
     assert "Quick Signal remains available" in result["user_friendly_error"]
     assert "debug_error" not in result
+
+
+def test_empty_provider_attempts_are_distinguished_without_fabricated_rows():
+    with (patch("tradebot.app.OpenBBClient.option_chain", return_value={"contracts": []}),
+          patch("tradebot.app.NSEOptionChainClient.option_chain", return_value={"contracts": [], "underlying_price": None})):
+        payload = client.get("/api/banknifty-options").json()
+    assert payload["failure_category"] == "provider_returned_empty"
+    assert "no valid option-chain rows" in payload["explanation"]
+    assert payload["provider_attempts"] == {"openbb": True, "nse_fallback": True}
+    assert payload["contracts"] == []

@@ -191,3 +191,21 @@ def test_all_paper_api_routes_support_the_dashboard_flow(tmp_path: Path, monkeyp
     note = client.post("/api/paper/journal", json={"note": "Review the setup", "symbol": "FLOWTEST"})
     assert note.status_code == 201
     assert len(client.get("/api/paper/journal").json()) == 1
+
+
+def test_paper_asset_links_cover_positions_trades_and_watchlist():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    assert 'href="/asset/${safe(x.market)}/${encodeURIComponent(x.symbol)}"' in javascript
+    assert "<td>${paperAssetLink(x)}</td>" in javascript
+    assert "<div class=\"paper-list\">${paperAssetLink(x)}" in javascript
+    assert javascript.count("<td>${paperAssetLink(x)}</td>") == 2
+    assert "market.startsWith('crypto_')&&symbol.endsWith('USDT')" in javascript
+    assert "market==='forex'&&symbol.length===6" in javascript
+
+
+def test_close_button_stops_navigation_and_quantity_is_bounded():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    close_handler = javascript.split("document.querySelectorAll('.close-paper')", 1)[1].split("document.querySelectorAll('.remove-watch')", 1)[0]
+    assert "event.preventDefault();event.stopPropagation()" in close_handler
+    assert "<td>${quantity(x.quantity)}</td>" in javascript
+    assert "Math.abs(n)>=1?4:Math.abs(n)>=.001?6:8" in javascript

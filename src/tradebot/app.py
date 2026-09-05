@@ -52,12 +52,26 @@ def _debug_enabled() -> bool:
 def _provider_failure_category(*errors: Exception) -> str:
     text = " ".join(str(error).lower() for error in errors)
     if any(word in text for word in ("blocked", "forbidden", "403", "unauthorized", "401")):
-        return "blocked by data source"
+        return "provider_unavailable"
     if any(word in text for word in ("empty", "no usable", "no banknifty", "no option")):
-        return "no option chain returned"
+        return "provider_returned_empty"
     if any(word in text for word in ("market closed", "stale")):
-        return "market closed / stale data"
-    return "provider unavailable"
+        return "market_closed_or_no_chain"
+    if errors and all(any(word in str(error).lower() for word in
+                          ("not configured", "missing configuration", "no provider"))
+                      for error in errors):
+        return "not_configured"
+    return "provider_unavailable" if errors else "unknown_failure"
+
+
+def _banknifty_explanation(category: str) -> str:
+    return {
+        "not_configured": "Bank Nifty options require a configured option-chain provider.",
+        "provider_unavailable": "Provider attempts completed, but a valid option chain could not be retrieved.",
+        "provider_returned_empty": "Provider attempts completed, but no valid option-chain rows were returned.",
+        "market_closed_or_no_chain": "No current option chain is available; the market may be closed or between listed chains.",
+        "unknown_failure": "The option chain could not be verified right now. Please retry shortly.",
+    }[category]
 
 
 def _provider_error(public_message: str, exc: Exception) -> HTTPException:
@@ -280,7 +294,9 @@ def create_app() -> FastAPI:
                 result = {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
                         "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
                         "research_only": True, "provider_attempts": {"openbb": True, "nse_fallback": True},
-                        "failure_category": category}
+                        "failure_category": category, "explanation": _banknifty_explanation(category),
+                        "last_checked": datetime.now(timezone.utc).isoformat(),
+                        "setup_note": "A reliable options data provider is required for production Bank Nifty option-chain coverage."}
                 if _debug_enabled():
                     result["provider_errors"] = {"openbb": f"{type(exc).__name__}: {exc}",
                                                  "nse_fallback": f"{type(nse_exc).__name__}: {nse_exc}"}

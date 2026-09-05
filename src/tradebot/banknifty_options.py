@@ -12,7 +12,7 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from .models import OptionContract
 
-UNAVAILABLE_MESSAGE = "Bank Nifty options data provider not configured yet."
+UNAVAILABLE_MESSAGE = "Real Bank Nifty option-chain data is temporarily unavailable."
 logger = logging.getLogger(__name__)
 
 
