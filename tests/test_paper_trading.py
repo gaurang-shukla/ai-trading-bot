@@ -376,10 +376,11 @@ def test_dashboard_names_capital_and_status_fields():
     assert "['Cash balance'" not in javascript
 
 
-def test_recent_exits_are_visible_before_open_positions_with_complete_history():
+def test_closed_history_follows_open_positions_without_recent_exits_panel():
     javascript = Path("src/tradebot/web/app.js").read_text()
-    assert javascript.index("Recent paper exits") < javascript.index("OPEN POSITIONS")
-    assert "paperTradeTable(trades.slice(0,5)" in javascript
+    assert "Recent paper exits" not in javascript
+    assert "paperTradeTable(trades.slice(0,5)" not in javascript
+    assert javascript.index("OPEN POSITIONS") < javascript.index("CLOSED TRADES")
     assert "Amount invested / Exit value" in javascript
     assert "Realized P&amp;L" in javascript
     assert "Status / Reason" in javascript

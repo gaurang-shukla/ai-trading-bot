@@ -24,13 +24,17 @@ INDIAN_RESEARCH_SYMBOLS = {
 logger = logging.getLogger(__name__)
 
 
-WEEX_RATIO_CHANGE_FIELDS = ("change", "changeRate", "riseFallRate", "change_rate")
-WEEX_PERCENT_CHANGE_FIELDS = ("priceChangePercent", "changePercent")
+WEEX_RATIO_CHANGE_FIELDS = ("change", "changeRate", "riseFallRate", "change_rate",
+                            "priceChangePercent")
+WEEX_PERCENT_CHANGE_FIELDS = ("changePercent",)
 WEEX_CHANGE_FIELDS = WEEX_RATIO_CHANGE_FIELDS + WEEX_PERCENT_CHANGE_FIELDS
 
 
 def weex_change_details(row: dict) -> tuple[str | None, object, float | None]:
     """Return the selected WEEX change field, its raw value, and percentage points."""
+    if row.get("_weex_change_normalized"):
+        value = _optional_float(row.get("change"))
+        return "change", row.get("change"), value
     field = next((name for name in WEEX_CHANGE_FIELDS if row.get(name) is not None), None)
     if field is None:
         return None, None, None
@@ -47,9 +51,9 @@ def weex_change_details(row: dict) -> tuple[str | None, object, float | None]:
 def normalize_weex_24h_change(row: dict) -> float | None:
     """Normalize WEEX's field-specific 24-hour change formats to percentage points.
 
-    WEEX's rate fields are ratios (2.0535 means 205.35%), whereas its percent
-    fields are already expressed in percentage points. A literal percent suffix
-    is unambiguous regardless of which field supplied it.
+    WEEX's spot and futures rate fields, including ``priceChangePercent``, are
+    ratios (2.0535 means 205.35%). A literal percent suffix is already percentage
+    points, and provider-normalized rows are returned unchanged.
     """
     return weex_change_details(row)[2]
 
@@ -60,11 +64,18 @@ def normalize_weex_ticker_row(row: dict, provider_market: str) -> dict:
     result = dict(row)
     result["change"] = normalized
     result["_weex_change_normalized"] = True
+    open_price = _optional_float(row.get("openPrice") or row.get("open_24h"))
+    last_price = _optional_float(row.get("lastPrice") or row.get("last") or row.get("price"))
+    computed_ratio = ((last_price - open_price) / open_price
+                      if open_price not in (None, 0) and last_price is not None else None)
     result["_weex_debug"] = {
         "provider_market": provider_market,
         "raw_change_field": field,
         "raw_change_value": raw,
         "normalized_change_percent": normalized,
+        "computed_change_ratio_from_open": computed_ratio,
+        "computed_change_percent_from_open": (computed_ratio * 100
+                                                if computed_ratio is not None else None),
     }
     return result
 

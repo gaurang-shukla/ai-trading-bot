@@ -21,11 +21,19 @@ def test_weex_ratio_change_fields_are_normalized_to_percentage_points():
     assert normalize_weex_24h_change({"change": 0.0003}) == pytest.approx(0.03)
 
 
-def test_weex_percentage_point_changes_are_not_multiplied_again():
-    assert normalize_weex_24h_change({"priceChangePercent": 211.41}) == 211.41
+def test_weex_price_change_percent_is_a_ratio_unless_suffixed():
+    assert normalize_weex_24h_change({"priceChangePercent": "2.018049"}) == pytest.approx(201.8049)
+    assert normalize_weex_24h_change({"priceChangePercent": "0.073518"}) == pytest.approx(7.3518)
+    assert normalize_weex_24h_change({"priceChangePercent": "16.652605"}) == pytest.approx(1665.2605)
+    assert normalize_weex_24h_change({"priceChangePercent": "0.000989"}) == pytest.approx(0.0989)
+    assert normalize_weex_24h_change({"changeRate": "211.15%"}) == 211.15
+    assert normalize_weex_24h_change({"priceChangePercent": "211.15%"}) == 211.15
     assert normalize_weex_24h_change({"changePercent": 211.41}) == 211.41
-    assert normalize_weex_24h_change({"changeRate": "211.41%"}) == 211.41
-    assert normalize_weex_24h_change({"priceChangePercent": 7.17}) == 7.17
+
+
+def test_already_normalized_weex_row_is_not_multiplied_again():
+    row = {"change": 201.8049, "_weex_change_normalized": True}
+    assert normalize_weex_24h_change(row) == 201.8049
 
 
 def test_crypto_overview_normalizes_bulla_change_rate():
@@ -65,33 +73,36 @@ def test_bulk_provider_to_overview_path_normalizes_once(monkeypatch, market, cli
 
 
 def test_overview_api_uses_normalized_provider_path_and_debug_is_opt_in(monkeypatch):
-    rows = [{"symbol": "BULLAUSDT", "lastPrice": "0.087191", "change": 2.111519}]
+    rows = [{"symbol": "BULLAUSDT", "openPrice": "0.027979", "lastPrice": "0.084442", "priceChangePercent": "2.018049"}]
     monkeypatch.setattr(WeexFuturesMarketData, "_get", lambda self, path, params: rows)
     cache = CachedMarketOverview(ttl_seconds=0)
     cache.refresh_cooldown_seconds = 0
     monkeypatch.setattr("tradebot.overview._overviews", cache)
     client = TestClient(create_app())
     clean = client.get("/api/overview/crypto_futures?refresh=true").json()["assets"][0]
-    assert clean["change"] == pytest.approx(211.1519)
+    assert clean["change"] == pytest.approx(201.8049)
     assert "raw_change_value" not in clean
+    assert "computed_change_ratio_from_open" not in clean
 
     monkeypatch.setenv("SIGNAL_DEBUG", "true")
     debug = client.get("/api/overview/crypto_futures?refresh=true").json()["assets"][0]
     assert debug["provider_market"] == "crypto_futures"
-    assert debug["raw_change_field"] == "change"
-    assert debug["raw_change_value"] == 2.111519
-    assert debug["normalized_change_percent"] == pytest.approx(211.1519)
+    assert debug["raw_change_field"] == "priceChangePercent"
+    assert debug["raw_change_value"] == "2.018049"
+    assert debug["normalized_change_percent"] == pytest.approx(201.8049)
+    assert debug["computed_change_ratio_from_open"] == pytest.approx(2.0180492512)
+    assert debug["computed_change_percent_from_open"] == pytest.approx(201.80492512)
 
 
 @pytest.mark.parametrize(("market", "client_class", "symbol", "raw", "expected"), [
-    ("crypto_futures", WeexFuturesMarketData, "BULLAUSDT", 2.067231, 206.7231),
-    ("crypto_futures", WeexFuturesMarketData, "BNBUSDT", 0.0717, 7.17),
-    ("crypto_spot", WeexSpotMarketData, "熊猫头USDT", 2.354281, 235.4281),
+    ("crypto_futures", WeexFuturesMarketData, "BULLAUSDT", "2.018049", 201.8049),
+    ("crypto_futures", WeexFuturesMarketData, "BNBUSDT", "0.073518", 7.3518),
+    ("crypto_spot", WeexSpotMarketData, "SUEUSDT", "16.652605", 1665.2605),
 ])
-def test_each_crypto_overview_api_normalizes_live_change_field(
+def test_each_crypto_overview_api_normalizes_live_price_change_percent(
         monkeypatch, market, client_class, symbol, raw, expected):
     monkeypatch.setattr(client_class, "_get", lambda self, path, params: [
-        {"symbol": symbol, "lastPrice": "1.25", "change": raw}
+        {"symbol": symbol, "lastPrice": "1.25", "priceChangePercent": raw}
     ])
     cache = CachedMarketOverview(ttl_seconds=0)
     cache.refresh_cooldown_seconds = 0
