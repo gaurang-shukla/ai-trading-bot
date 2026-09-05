@@ -24,6 +24,44 @@ INDIAN_RESEARCH_SYMBOLS = {
 logger = logging.getLogger(__name__)
 
 
+_WEEX_RATIO_CHANGE_FIELDS = ("change", "changeRate", "riseFallRate", "change_rate")
+_WEEX_PERCENT_CHANGE_FIELDS = ("priceChangePercent", "changePercent")
+
+
+def normalize_weex_24h_change(value, field_name: str | None = None) -> float | None:
+    """Convert one WEEX 24-hour change value to percentage points.
+
+    WEEX's rate fields are ratios, including the futures bulk ticker's
+    misleadingly generic ``change`` field. Explicit percent fields and values
+    carrying a percent suffix are already percentage points.
+    """
+    if value is None:
+        return None
+    percent_string = isinstance(value, str) and value.strip().endswith("%")
+    if percent_string:
+        value = value.strip()[:-1]
+    normalized = _optional_float(value)
+    if normalized is None:
+        return None
+    if not percent_string and field_name in _WEEX_RATIO_CHANGE_FIELDS:
+        normalized *= 100
+    return normalized
+
+
+def _normalize_weex_ticker(row: dict) -> dict:
+    """Normalize a raw ticker exactly once at the WEEX provider boundary."""
+    if row.get("_weex_change_normalized") is True:
+        return row
+    field = next((name for name in (*_WEEX_RATIO_CHANGE_FIELDS, *_WEEX_PERCENT_CHANGE_FIELDS)
+                  if row.get(name) is not None), None)
+    normalized = normalize_weex_24h_change(row.get(field), field) if field else None
+    result = {**row, "changePercent": normalized, "_weex_change_normalized": True}
+    if os.getenv("SIGNAL_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        result.update({"raw_change_field": field, "raw_change_value": row.get(field) if field else None,
+                       "normalized_change_percent": normalized})
+    return result
+
+
 def research_symbol(symbol: str) -> str:
     """Translate an exchange crypto pair into the format used by research feeds."""
     value = symbol.upper().replace("/", "").replace(":", "")
@@ -221,16 +259,17 @@ class WeexSpotMarketData(_WeexPublicClient):
 
     def snapshot(self, symbol: str) -> MarketSnapshot:
         payload = self._get("/api/v3/market/ticker/24hr", {"symbol": symbol.upper()})
-        row = payload[0] if isinstance(payload, list) else payload
+        row = _normalize_weex_ticker(payload[0] if isinstance(payload, list) else payload)
         return MarketSnapshot(symbol.upper(), float(row["lastPrice"]),
                               self._timestamp(row.get("closeTime")), "weex_spot_v3",
-                              _optional_float(row.get("priceChangePercent") or row.get("changeRate")),
+                              row["changePercent"],
                               _optional_float(row.get("quoteVolume") or row.get("volume")), None,
                               _ticker_volatility(row))
 
     def tickers(self) -> list[dict]:
         payload = self._get("/api/v3/market/ticker/24hr", {})
-        return payload if isinstance(payload, list) else [payload]
+        rows = payload if isinstance(payload, list) else [payload]
+        return [_normalize_weex_ticker(row) for row in rows]
 
     def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
         payload = self._get("/api/v3/market/klines", {"symbol": symbol.upper(),
@@ -243,11 +282,11 @@ class WeexFuturesMarketData(_WeexPublicClient):
 
     def snapshot(self, symbol: str) -> MarketSnapshot:
         payload = self._get("/capi/v3/market/ticker/24hr", {"symbol": symbol.upper()})
-        row = payload[0] if isinstance(payload, list) else payload
+        row = _normalize_weex_ticker(payload[0] if isinstance(payload, list) else payload)
         price = row.get("lastPrice") or row.get("last") or row.get("markPrice") or row.get("price")
         return MarketSnapshot(symbol.upper(), float(price),
                               self._timestamp(row.get("closeTime") or row.get("time")), "weex_futures_v3",
-                              _optional_float(row.get("priceChangePercent") or row.get("changeRate")),
+                              row["changePercent"],
                               _optional_float(row.get("quoteVolume") or row.get("volume")),
                               _optional_float(row.get("fundingRate") or row.get("lastFundingRate")),
                               _ticker_volatility(row))
@@ -258,7 +297,8 @@ class WeexFuturesMarketData(_WeexPublicClient):
 
     def tickers(self) -> list[dict]:
         payload = self._get("/capi/v3/market/ticker/24hr", {})
-        return payload if isinstance(payload, list) else [payload]
+        rows = payload if isinstance(payload, list) else [payload]
+        return [_normalize_weex_ticker(row) for row in rows]
 
     def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
         payload = self._get("/capi/v3/market/klines", {"symbol": symbol.upper(),

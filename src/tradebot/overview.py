@@ -59,14 +59,19 @@ def _ticker_rows(raw: list[dict]) -> list[dict]:
         try:
             symbol = str(item.get("symbol", "")).upper()
             price = float(item.get("lastPrice") or item.get("last") or 0)
-            change = float(item.get("priceChangePercent") or item.get("changeRate") or 0)
+            change = item.get("changePercent")
+            change = 0.0 if change is None else float(change)
             high = float(item.get("highPrice") or item.get("high_24h") or price)
             low = float(item.get("lowPrice") or item.get("low_24h") or price)
             volume = float(item.get("quoteVolume") or item.get("quoteVolume_24h") or item.get("volume_24h") or 0)
             if symbol and price > 0:
-                rows.append({"symbol": symbol, "price": price, "change": change,
+                row = {"symbol": symbol, "price": price, "change": change,
                              "high": high, "low": low, "volume": volume,
-                             "volatility": abs(high - low) / price * 100})
+                             "volatility": abs(high - low) / price * 100}
+                if os.getenv("SIGNAL_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}:
+                    row.update({key: item.get(key) for key in
+                                ("raw_change_field", "raw_change_value", "normalized_change_percent")})
+                rows.append(row)
         except (TypeError, ValueError):
             continue
     return rows

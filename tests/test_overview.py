@@ -1,4 +1,7 @@
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from tradebot.models import MarketKind
 from tradebot.models import MarketSnapshot
@@ -12,11 +15,54 @@ def test_crypto_overview_ranks_real_ticker_fields():
         {"symbol": "BBBUSDT", "lastPrice": "20", "priceChangePercent": "-4",
          "highPrice": "21", "lowPrice": "19", "quoteVolume": "500000"},
     ]
-    with patch("tradebot.overview.WeexFuturesMarketData.tickers", return_value=tickers):
+    with patch("tradebot.adapters.WeexFuturesMarketData._get", return_value=tickers):
         result = crypto_overview(MarketKind.CRYPTO_FUTURES)
     assert result["gainers"][0]["symbol"] == "AAAUSDT"
     assert result["losers"][0]["symbol"] == "BBBUSDT"
     assert all(0 <= row["signal_score"] <= 100 for row in result["assets"])
+
+
+def test_futures_overview_normalizes_confirmed_bulla_change_once(monkeypatch):
+    tickers = [
+        {"symbol": "BULLAUSDT", "lastPrice": "0.086498", "change": "2.104292",
+         "highPrice": "0.091334", "lowPrice": "0.025667", "quoteVolume": "67111568.7773"},
+        {"symbol": "BTCUSDT", "lastPrice": "100", "change": "0.0211",
+         "highPrice": "102", "lowPrice": "98", "quoteVolume": "1000"},
+    ]
+    monkeypatch.setattr("tradebot.adapters.WeexFuturesMarketData._get", lambda *args: tickers)
+    result = MarketOverviewService().build(MarketKind.CRYPTO_FUTURES)
+    bulla = next(row for row in result["assets"] if row["symbol"] == "BULLAUSDT")
+    assert bulla["change"] == pytest.approx(210.4292)
+    assert result["gainers"][0]["change"] == pytest.approx(210.4292)
+
+
+def test_futures_snapshot_uses_same_provider_boundary_normalization(monkeypatch):
+    payload = {"symbol": "BULLAUSDT", "lastPrice": "0.086498", "changeRate": "2.104292"}
+    monkeypatch.setattr("tradebot.adapters.WeexFuturesMarketData._get", lambda *args: payload)
+    from tradebot.adapters import WeexFuturesMarketData
+
+    snapshot = WeexFuturesMarketData().snapshot("BULLAUSDT")
+    assert snapshot.change_24h == pytest.approx(210.4292)
+
+
+def test_weex_change_debug_fields_are_opt_in(monkeypatch):
+    payload = [{"symbol": "BULLAUSDT", "lastPrice": "0.086498", "change": "2.104292"}]
+    monkeypatch.setattr("tradebot.adapters.WeexFuturesMarketData._get", lambda *args: payload)
+    normal = MarketOverviewService().build(MarketKind.CRYPTO_FUTURES)["assets"][0]
+    assert "raw_change_value" not in normal
+
+    monkeypatch.setenv("SIGNAL_DEBUG", "true")
+    debug = MarketOverviewService().build(MarketKind.CRYPTO_FUTURES)["assets"][0]
+    assert debug["raw_change_field"] == "change"
+    assert debug["raw_change_value"] == "2.104292"
+    assert debug["normalized_change_percent"] == pytest.approx(210.4292)
+
+
+def test_movers_render_provider_percentage_without_client_scaling():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    mover = javascript.split("function moverRows", 1)[1].split("function opportunityHelp", 1)[0]
+    assert "pct(row.change)" in mover
+    assert "row.change*100" not in mover
 
 
 def test_non_crypto_overview_is_fully_populated_from_openbb(monkeypatch):
