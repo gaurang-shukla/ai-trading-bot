@@ -21,7 +21,9 @@ from .analysis import (CandleCache, DeepJobRegistry, FastAIExplainer, QuickResul
                        QuickSignalEngine, TIMEFRAMES, deterministic_fast_explanation,
                        normalize_deep_reasoning)
 from .assets import asset_metadata, public_metadata
-from .banknifty_options import NSEOptionChainClient, UNAVAILABLE_MESSAGE, build_chain
+from .banknifty_options import (NSEOptionChainClient, UNAVAILABLE_MESSAGE,
+                                build_chain, classify_openbb_failure,
+                                empty_provider_diagnostic)
 from .diagnostics import diagnostics
 from .config import load_project_env
 from .execution import PaperBroker
@@ -275,38 +277,67 @@ def create_app() -> FastAPI:
     def banknifty_options(expiry: str | None = None, option_type: str | None = None,
                           moneyness: str | None = None):
         """Return a genuine OpenBB/NSE chain or an explicit unavailable state."""
+        openbb_diag = empty_provider_diagnostic("openbb")
+        openbb_diag["attempted"] = True
+        provider = OpenBBClient(asset_class="index")
+        openbb_diag["final_url"] = (f"{provider.base_url}/api/v1/derivatives/options/chains"
+                                    "?symbol=BANKNIFTY")
         try:
-            provider = OpenBBClient(asset_class="index")
             raw = provider.option_chain("BANKNIFTY", expiry)
             if not raw.get("contracts"):
+                openbb_diag["failure_category"] = "openbb_empty_chain"
+                openbb_diag["sanitized_error"] = "OpenBB returned no valid BANKNIFTY option rows"
                 raise ValueError("OpenBB returned no BANKNIFTY option contracts")
             spot = provider.snapshot("^NSEBANK").price
+            verified = build_chain(raw, spot)
+            if not verified["contracts"]:
+                raise ValueError("OpenBB returned no valid BANKNIFTY option contracts")
+            openbb_diag["raw_row_count"] = len(raw["contracts"])
+            openbb_diag["ce_count"] = sum(row.get("option_type", "").upper() in {"CE", "CALL", "C"} for row in raw["contracts"])
+            openbb_diag["pe_count"] = sum(row.get("option_type", "").upper() in {"PE", "PUT", "P"} for row in raw["contracts"])
+            openbb_diag["normalized_contract_count"] = len(verified["contracts"])
         except Exception as exc:
             diagnostics.failure("openbb", exc)
+            openbb_diag["failure_category"] = openbb_diag["failure_category"] or classify_openbb_failure(exc)
+            openbb_diag["sanitized_error"] = openbb_diag["sanitized_error"] or {
+                "openbb_connection_refused": "Local OpenBB service refused the connection",
+                "openbb_option_chain_unsupported": "OpenBB route/provider does not support this option chain",
+                "openbb_empty_chain": "OpenBB returned no valid BANKNIFTY option rows",
+                "openbb_provider_error": "OpenBB option-chain request failed",
+            }[openbb_diag["failure_category"]]
+            nse = NSEOptionChainClient()
             try:
-                raw = NSEOptionChainClient().option_chain(expiry)
+                raw = nse.option_chain(expiry)
                 if not raw.get("contracts") or raw.get("underlying_price") is None:
                     raise ValueError("NSE returned no usable BANKNIFTY option contracts")
                 spot = raw["underlying_price"]
             except Exception as nse_exc:
                 diagnostics.failure("nse", nse_exc)
-                category = _provider_failure_category(exc, nse_exc)
+                nse_diag = getattr(nse_exc, "diagnostic", None) or nse.diagnostic
+                if not nse_diag["failure_category"]:
+                    nse_diag["failure_category"] = "nse_empty_chain" if "no usable" in str(nse_exc) else "nse_http_error"
+                    nse_diag["sanitized_error"] = "NSE returned no valid option rows" if "no usable" in str(nse_exc) else "NSE option-chain request failed"
+                category = (nse_diag["failure_category"] if nse_diag["failure_category"] in
+                            {"nse_blocked_by_provider", "nse_http_error", "nse_html_instead_of_json", "nse_empty_chain"}
+                            else "temporarily_unavailable")
                 result = {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
                         "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
                         "research_only": True, "provider_attempts": {"openbb": True, "nse_fallback": True},
-                        "failure_category": category, "explanation": _banknifty_explanation(category),
-                        "provider_status": ("not_configured" if category == "not_configured"
-                                            else "temporarily_unavailable"),
+                        "failure_category": category,
+                        "explanation": "Provider attempts completed, but a valid option chain could not be retrieved.",
+                        "provider_status": category if category != "nse_empty_chain" else "nse_empty_chain",
                         "last_checked": datetime.now(timezone.utc).isoformat(),
                         "setup_note": "A reliable options data provider is required for production Bank Nifty option-chain coverage."}
                 if _debug_enabled():
-                    result["provider_errors"] = {"openbb": f"{type(exc).__name__}: {exc}",
-                                                 "nse_fallback": f"{type(nse_exc).__name__}: {nse_exc}"}
+                    result["provider_diagnostics"] = [openbb_diag, nse_diag]
                 return result
         result = build_chain(raw, spot, expiry, option_type, moneyness)
         # Filters may legitimately select no contracts while the provider remains available.
         result["available"] = True
         result["provider_status"] = "connected"
+        if _debug_enabled():
+            active = openbb_diag if result["source"] == "OpenBB" else nse.diagnostic
+            result["provider_diagnostics"] = [openbb_diag] + ([] if active is openbb_diag else [active])
         return result
 
     @app.get("/api/markets")
