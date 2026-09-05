@@ -164,7 +164,10 @@ class PaperStore:
 
     def trades(self) -> list[dict]:
         with self._connect() as db:
-            rows = db.execute("SELECT * FROM paper_trades ORDER BY closed_at DESC").fetchall()
+            rows = db.execute(
+                "SELECT t.*, p.display_name FROM paper_trades t "
+                "LEFT JOIN paper_positions p ON p.id=t.position_id ORDER BY t.closed_at DESC"
+            ).fetchall()
         result = []
         for row in rows:
             item = dict(row); item["signal_snapshot"] = json.loads(item["signal_snapshot"])

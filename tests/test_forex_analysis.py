@@ -48,7 +48,7 @@ def test_forex_metadata_maps_every_public_pair_to_yahoo_symbol():
         "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD"
     )}
     assert {symbol: metadata.provider_symbol for symbol, metadata in FOREX.items()} == expected
-    assert asset_metadata(MarketKind.FOREX, "audusd").display_name == "AUD/USD forex pair"
+    assert asset_metadata(MarketKind.FOREX, "audusd").display_name == "AUD/USD"
 
 
 def test_forex_asset_analysis_uses_provider_symbol_and_keeps_public_metadata():
@@ -59,7 +59,7 @@ def test_forex_asset_analysis_uses_provider_symbol_and_keeps_public_metadata():
     assert set(provider.symbols) == {"AUDUSD=X"}
     assert body["symbol"] == "AUDUSD"
     assert body["provider_symbol"] == "AUDUSD=X"
-    assert body["display_name"] == "AUD/USD forex pair"
+    assert body["display_name"] == "AUD/USD"
     assert body["volume"] is None
     assert body["chart_timeframes"]["1h"]
 
@@ -102,3 +102,10 @@ def test_frontend_formats_forex_prices_volume_and_market_aware_surfaces():
     assert "if(market==='forex')return side==='LONG'?'Buy base currency paper trade':'Sell base currency paper trade'" in javascript
     assert "Internal side: ${safe(x.side)}" in javascript
     assert "errorView(error,{market,asset:true,retryPath:" in javascript
+
+
+def test_forex_labels_are_clean_while_helper_copy_remains():
+    assert all("forex pair" not in item.display_name.lower() for item in FOREX.values())
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    assert "AUD/USD forex pair" not in javascript
+    assert "first currency is the base currency and the second is the quote currency" in javascript

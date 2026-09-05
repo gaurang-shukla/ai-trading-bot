@@ -35,7 +35,7 @@ FOREX = {
     symbol: AssetMetadata(
         symbol,
         f"{symbol}=X",
-        f"{symbol[:3]}/{symbol[3:]} forex pair",
+        f"{symbol[:3]}/{symbol[3:]}",
         "In forex, the first currency is the base currency and the second is the quote currency.",
     )
     for symbol in _FOREX_PAIRS
