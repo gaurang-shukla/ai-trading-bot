@@ -13,6 +13,7 @@ class AssetMetadata:
     provider_symbol: str
     display_name: str
     description: str
+    instrument_type: str
 
 
 _COMMODITY_NAMES = {
@@ -26,7 +27,7 @@ _COMMODITY_NAMES = {
 }
 
 COMMODITIES = {
-    symbol: AssetMetadata(symbol, f"{symbol}=F", f"{name} futures", description)
+    symbol: AssetMetadata(symbol, f"{symbol}=F", name, description, "Commodity futures")
     for symbol, (name, description) in _COMMODITY_NAMES.items()
 }
 
@@ -37,12 +38,16 @@ FOREX = {
         f"{symbol}=X",
         f"{symbol[:3]}/{symbol[3:]}",
         "In forex, the first currency is the base currency and the second is the quote currency.",
+        "Forex",
     )
     for symbol in _FOREX_PAIRS
 }
 
 _EQUITY_NAMES = {
-    "SBIN.NS": "SBI / State Bank of India",
+    "HDFCBANK.NS": "HDFC Bank",
+    "RELIANCE.NS": "Reliance",
+    "INFY.NS": "Infosys",
+    "SBIN.NS": "SBI",
 }
 
 
@@ -53,14 +58,17 @@ def asset_metadata(market: MarketKind, symbol: str) -> AssetMetadata:
     if market is MarketKind.FOREX and symbol in FOREX:
         return FOREX[symbol]
     if market in (MarketKind.CRYPTO_FUTURES, MarketKind.CRYPTO_SPOT) and symbol.endswith("USDT"):
-        return AssetMetadata(symbol, symbol, f"{symbol[:-4]}/USDT", "")
+        kind = "Crypto futures" if market is MarketKind.CRYPTO_FUTURES else "Crypto spot"
+        return AssetMetadata(symbol, symbol, f"{symbol[:-4]}/USDT", "", kind)
     if market is MarketKind.EQUITIES:
-        display = _EQUITY_NAMES.get(symbol, f"{symbol.removesuffix('.NS')} shares")
-        return AssetMetadata(symbol, symbol, display, "")
+        display = _EQUITY_NAMES.get(symbol, symbol)
+        kind = "Indian equity" if symbol.endswith(".NS") else "US equity"
+        return AssetMetadata(symbol, symbol, display, "", kind)
     if market is MarketKind.INDIAN_INDICES and symbol in _EQUITY_NAMES:
-        return AssetMetadata(symbol, symbol, _EQUITY_NAMES[symbol], "")
+        return AssetMetadata(symbol, symbol, _EQUITY_NAMES[symbol], "", "Indian equity")
     display = symbol.removesuffix(".NS") if symbol.endswith(".NS") else symbol
-    return AssetMetadata(symbol, symbol, display, "")
+    kind = "Indian equity" if symbol.endswith(".NS") else "Indian index" if market is MarketKind.INDIAN_INDICES else market.value.replace("_", " ").title()
+    return AssetMetadata(symbol, symbol, display, "", kind)
 
 
 def public_metadata(market: MarketKind, symbol: str) -> dict:

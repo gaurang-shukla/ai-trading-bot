@@ -53,7 +53,9 @@ def test_banknifty_ui_renders_attempt_metadata():
     assert "OpenBB tried:" in javascript
     assert "NSE fallback tried:" in javascript
     assert "Failure category:" in javascript
-    assert "Bank Nifty options data unavailable" in javascript
+    assert "Live Bank Nifty options require a reliable option-chain provider." in javascript
+    assert "Import option-chain CSV" in javascript
+    assert "Imported/demo data, not live" in javascript
     assert "retry-banknifty" in javascript
     assert "No fake rows shown" in javascript
     assert "provider not configured yet" not in javascript
