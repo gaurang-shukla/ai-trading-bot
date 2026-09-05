@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import os
 import secrets
 import json
@@ -139,7 +140,9 @@ def integration_status() -> dict:
     # authenticated path in either direction.  Signal is ready to integrate only
     # when Paperclip can call its protected endpoint, or when Signal can report to
     # an authenticated task bridge.
-    paperclip_configured = bool(os.getenv("PAPERCLIP_BRIDGE_TOKEN") or paperclip.configured)
+    inbound_bridge = bool(os.getenv("PAPERCLIP_BRIDGE_TOKEN"))
+    outbound_bridge = paperclip.configured
+    paperclip_configured = inbound_bridge or outbound_bridge
     return {
         "openbb": {
             # OpenBB is consumed as a service, so its Python package need not be local.
@@ -158,7 +161,7 @@ def integration_status() -> dict:
             "installed": True,
             "configured": paperclip_configured,
             "ready": paperclip_configured,
-            "enabled": paperclip.enabled or bool(os.getenv("PAPERCLIP_BRIDGE_TOKEN")),
+            "enabled": paperclip_configured,
             "role": "optional control and audit bridge",
         },
         "weex": {
@@ -546,7 +549,7 @@ def create_app() -> FastAPI:
         selection = MarketSelection(MarketKind(market), "weex" if market.startswith("crypto_") else "openbb",
                                     symbol.upper())
         price = float(default_registry().market_data(selection).snapshot(symbol.upper()).price)
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             raise ValueError("Live price is missing or invalid")
         return price
 
@@ -570,6 +573,11 @@ def create_app() -> FastAPI:
 
     @app.post("/api/paper/positions", status_code=201)
     def open_paper_position(request: OpenPaperPositionRequest):
+        if request.market is MarketKind.BANKNIFTY_OPTIONS:
+            raise HTTPException(
+                409,
+                "Bank Nifty Options are research-only until a valid priced option contract is available.",
+            )
         analyze_request = AnalyzeRequest(symbol=request.symbol, market=request.market,
                                          venue="weex" if request.market.value.startswith("crypto_") else "openbb")
         quick = quick_results.get(request.market.value, request.symbol) or quick_analyze(analyze_request)
@@ -583,8 +591,11 @@ def create_app() -> FastAPI:
         side = request.side or ("LONG" if "BUY" in action else "SHORT" if "SELL" in action else None)
         if side is None:
             raise HTTPException(422, "Choose LONG or SHORT when forcing a HOLD signal")
-        price = float(quick.get("live_price") or 0)
-        if price <= 0:
+        try:
+            price = float(quick.get("live_price"))
+        except (TypeError, ValueError):
+            price = 0
+        if not math.isfinite(price) or price <= 0:
             raise HTTPException(422, "A valid live price is required for a paper trade")
         plan = quick.get("risk_plan") or {}
         default_notional = paper.account()["equity"] * float(plan.get("position_size_pct") or .01)
@@ -602,10 +613,18 @@ def create_app() -> FastAPI:
         if not position:
             raise HTTPException(404, "Open paper position not found")
         try:
-            return paper.close_position(position_id, _paper_quote(position["market"], position["symbol"]),
-                                        request.close_reason)
+            quote_price = _paper_quote(position["market"], position["symbol"])
+            return paper.close_position(position_id, quote_price, request.close_reason)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(409, "This paper position is already closed") from exc
+        except Exception as exc:
+            diagnostics.failure("paper_quote", exc)
+            detail = "A current market price is unavailable, so this paper position was not closed. Please retry."
+            if _debug_enabled():
+                detail += f" ({type(exc).__name__}: {exc})"
+            raise HTTPException(503, detail) from exc
 
     @app.get("/api/paper/trades")
     def paper_trades():

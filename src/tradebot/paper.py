@@ -7,10 +7,12 @@ passed in by the web service and every mutation is recorded in local SQLite.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,23 +22,77 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_SECRET_WORDS = ("api_key", "secret", "token", "password", "passphrase", "authorization")
+
+
+def _safe_snapshot(value: Any) -> Any:
+    """Copy JSON data while removing credentials accidentally supplied by a caller."""
+    if isinstance(value, dict):
+        return {str(key): _safe_snapshot(item) for key, item in value.items()
+                if not any(word in str(key).lower() for word in _SECRET_WORDS)}
+    if isinstance(value, (list, tuple)):
+        return [_safe_snapshot(item) for item in value]
+    return value
+
+
+def _positive_number(value: Any, label: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a positive number") from exc
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError(f"{label} must be a positive number")
+    return result
+
+
 class PaperStore:
     """Small SQLite repository for the paper account, positions and journal."""
 
     def __init__(self, path: str | Path | None = None, starting_cash: float | None = None):
         self.path = Path(path or os.getenv("SIGNAL_DB_PATH", "data/signal.db"))
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.starting_cash = float(starting_cash or os.getenv("PAPER_STARTING_CASH", "100000"))
-        if not 0 < self.starting_cash <= 1_000_000_000:
+        configured_cash = starting_cash if starting_cash is not None else os.getenv("PAPER_STARTING_CASH", "100000")
+        self.starting_cash = _positive_number(configured_cash, "PAPER_STARTING_CASH")
+        if self.starting_cash > 1_000_000_000:
             raise ValueError("PAPER_STARTING_CASH must be a positive, sensible amount")
         self._lock = threading.RLock()
-        self._initialize()
+        self.recovered_database: Path | None = None
+        try:
+            self._initialize()
+        except sqlite3.DatabaseError:
+            # Never overwrite an unreadable portfolio. Quarantine it for manual
+            # recovery and bring paper mode back with a clean, local database.
+            if not self.path.exists():
+                raise
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
+            self.path.replace(backup)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{self.path}{suffix}")
+                if sidecar.exists():
+                    sidecar.replace(Path(f"{backup}{suffix}"))
+            self.recovered_database = backup
+            self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=10000")
         return connection
+
+    @contextmanager
+    def _database(self):
+        """Always commit/roll back and close SQLite handles, including on errors."""
+        db = self._connect()
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def _initialize(self) -> None:
         schema = """
@@ -70,38 +126,46 @@ class PaperStore:
           created_at TEXT NOT NULL
         );
         """
-        with self._lock, self._connect() as db:
+        with self._lock, self._database() as db:
             db.executescript(schema)
             db.execute("INSERT OR IGNORE INTO paper_account VALUES (1,?,?,0)",
                        (self.starting_cash, self.starting_cash))
+            db.execute("PRAGMA user_version=1")
 
     @staticmethod
     def pnl(side: str, entry: float, current: float, quantity: float) -> float:
+        if side not in {"LONG", "SHORT"}:
+            raise ValueError("Side must be LONG or SHORT")
+        entry = _positive_number(entry, "Entry price")
+        current = _positive_number(current, "Current price")
+        quantity = _positive_number(quantity, "Quantity")
         return (current - entry) * quantity if side == "LONG" else (entry - current) * quantity
 
     def positions(self) -> list[dict[str, Any]]:
-        with self._connect() as db:
+        with self._database() as db:
             rows = db.execute("SELECT * FROM paper_positions WHERE status='open' ORDER BY opened_at DESC").fetchall()
         return [self._position(row) for row in rows]
 
     def _position(self, row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
-        item["signal_snapshot"] = json.loads(item["signal_snapshot"])
+        try:
+            item["signal_snapshot"] = json.loads(item["signal_snapshot"])
+        except (TypeError, json.JSONDecodeError):
+            item["signal_snapshot"] = {}
         profit = self.pnl(item["side"], item["entry_price"], item["current_price"], item["quantity"])
         item["unrealized_pnl"] = profit
         item["unrealized_pnl_pct"] = profit / item["notional_value"] * 100
         return item
 
     def mark(self, position_id: str, price: float) -> None:
-        if price <= 0:
-            return
-        with self._lock, self._connect() as db:
+        price = _positive_number(price, "Current price")
+        with self._lock, self._database() as db:
             db.execute("UPDATE paper_positions SET current_price=? WHERE id=? AND status='open'", (price, position_id))
 
     def account(self) -> dict[str, Any]:
         positions = self.positions()
         unrealized = sum(item["unrealized_pnl"] for item in positions)
-        with self._connect() as db:
+        with self._database() as db:
             account = dict(db.execute("SELECT * FROM paper_account WHERE id=1").fetchone())
             count, wins = db.execute("SELECT COUNT(*), COALESCE(SUM(realized_pnl>0),0) FROM paper_trades").fetchone()
         equity = account["cash_balance"] + sum(x["notional_value"] for x in positions) + unrealized
@@ -113,12 +177,12 @@ class PaperStore:
 
     def open_position(self, *, market: str, symbol: str, display_name: str, side: str,
                       price: float, notional: float, signal: dict, risk_plan: dict) -> dict:
-        if side not in {"LONG", "SHORT"} or price <= 0 or notional <= 0:
-            raise ValueError("A valid side, live price, and positive notional amount are required")
-        if notional > self.account()["cash_balance"]:
-            raise ValueError("Notional amount exceeds available paper cash")
+        if side not in {"LONG", "SHORT"}:
+            raise ValueError("Side must be LONG or SHORT")
+        price = _positive_number(price, "Live price")
+        notional = _positive_number(notional, "Notional amount")
         quantity = notional / price
-        if not (0 < quantity < 1e15):
+        if not math.isfinite(quantity) or not (0 < quantity <= 1e18):
             raise ValueError("Calculated quantity is invalid")
         item = {"id": uuid.uuid4().hex, "market": market, "symbol": symbol.upper(),
                 "display_name": display_name, "side": side, "entry_price": price,
@@ -127,8 +191,18 @@ class PaperStore:
                 "risk_score": risk_plan.get("risk_score"), "confidence": signal.get("confidence"),
                 "position_size_pct": risk_plan.get("position_size_pct"), "opened_at": _now(),
                 "source_signal_action": str(signal.get("side", "HOLD")), "status": "open",
-                "signal_snapshot": {"signal": signal, "risk_plan": risk_plan, "live_price": price}}
-        with self._lock, self._connect() as db:
+                "signal_snapshot": _safe_snapshot({"signal": signal, "risk_plan": risk_plan,
+                                                   "live_price": price})}
+        with self._lock, self._database() as db:
+            # BEGIN IMMEDIATE serializes the balance check across processes and
+            # across multiple PaperStore instances, not only threads in this instance.
+            db.execute("BEGIN IMMEDIATE")
+            duplicate = db.execute(
+                "SELECT 1 FROM paper_positions WHERE market=? AND symbol=? AND status='open'",
+                (market, item["symbol"]),
+            ).fetchone()
+            if duplicate:
+                raise ValueError("An open paper position already exists for this asset")
             db.execute("UPDATE paper_account SET cash_balance=cash_balance-? WHERE id=1 AND cash_balance>=?",
                        (notional, notional))
             if not db.execute("SELECT changes()").fetchone()[0]:
@@ -140,9 +214,12 @@ class PaperStore:
         return next(position for position in self.positions() if position["id"] == position_id)
 
     def close_position(self, position_id: str, price: float, reason: str = "Closed by user") -> dict:
-        if price <= 0:
-            raise ValueError("A valid live price is required to close")
-        with self._lock, self._connect() as db:
+        price = _positive_number(price, "Live price")
+        if not isinstance(reason, str):
+            raise ValueError("Close reason must be text")
+        reason = reason.strip()[:200] or "Closed by user"
+        with self._lock, self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM paper_positions WHERE id=? AND status='open'", (position_id,)).fetchone()
             if not row:
                 raise KeyError(position_id)
@@ -153,7 +230,7 @@ class PaperStore:
                      "exit_price": price, "quantity": position["quantity"], "realized_pnl": profit,
                      "realized_pnl_pct": profit / position["notional_value"] * 100,
                      "opened_at": position["opened_at"], "closed_at": _now(),
-                     "close_reason": reason[:200] or "Closed by user", "signal_snapshot": position["signal_snapshot"]}
+                     "close_reason": reason, "signal_snapshot": position["signal_snapshot"]}
             db.execute("UPDATE paper_positions SET status='closed',current_price=? WHERE id=?", (price, position_id))
             db.execute("UPDATE paper_account SET cash_balance=cash_balance+?, realized_pnl=realized_pnl+? WHERE id=1",
                        (position["notional_value"] + profit, profit))
@@ -163,43 +240,55 @@ class PaperStore:
         return trade
 
     def trades(self) -> list[dict]:
-        with self._connect() as db:
+        with self._database() as db:
             rows = db.execute(
                 "SELECT t.*, p.display_name FROM paper_trades t "
                 "LEFT JOIN paper_positions p ON p.id=t.position_id ORDER BY t.closed_at DESC"
             ).fetchall()
         result = []
         for row in rows:
-            item = dict(row); item["signal_snapshot"] = json.loads(item["signal_snapshot"])
+            item = dict(row)
+            try:
+                item["signal_snapshot"] = json.loads(item["signal_snapshot"])
+            except (TypeError, json.JSONDecodeError):
+                item["signal_snapshot"] = {}
             item["result"] = "win" if item["realized_pnl"] > 0 else "loss" if item["realized_pnl"] < 0 else "breakeven"
             result.append(item)
         return result
 
     def watchlist(self) -> list[dict]:
-        with self._connect() as db:
+        with self._database() as db:
             return [dict(x) for x in db.execute("SELECT * FROM watchlist_items ORDER BY added_at DESC")]
 
     def add_watchlist(self, item: dict) -> dict:
         values = (item["market"], item["symbol"].upper(), item.get("display_name") or item["symbol"].upper(),
                   _now(), item.get("latest_action"), item.get("latest_confidence"), item.get("latest_price"))
-        with self._lock, self._connect() as db:
-            db.execute("INSERT OR REPLACE INTO watchlist_items VALUES (?,?,?,?,?,?,?)", values)
+        with self._lock, self._database() as db:
+            # Do not replace the row: preserving added_at makes duplicate clicks idempotent.
+            db.execute("INSERT INTO watchlist_items VALUES (?,?,?,?,?,?,?) "
+                       "ON CONFLICT(market,symbol) DO UPDATE SET "
+                       "display_name=excluded.display_name, latest_action=excluded.latest_action, "
+                       "latest_confidence=excluded.latest_confidence, latest_price=excluded.latest_price", values)
         return next(x for x in self.watchlist() if x["market"] == values[0] and x["symbol"] == values[1])
 
     def delete_watchlist(self, market: str, symbol: str) -> bool:
-        with self._lock, self._connect() as db:
+        with self._lock, self._database() as db:
             cursor = db.execute("DELETE FROM watchlist_items WHERE market=? AND symbol=?", (market, symbol.upper()))
             return cursor.rowcount > 0
 
     def journal(self) -> list[dict]:
-        with self._connect() as db:
+        with self._database() as db:
             return [dict(x) for x in db.execute("SELECT * FROM journal_notes ORDER BY created_at DESC")]
 
     def add_note(self, note: str, position_id: str | None = None, symbol: str | None = None) -> dict:
-        if not note.strip():
+        if not isinstance(note, str) or not note.strip():
             raise ValueError("Note cannot be empty")
+        if position_id:
+            with self._database() as db:
+                if not db.execute("SELECT 1 FROM paper_positions WHERE id=?", (position_id,)).fetchone():
+                    raise ValueError("Paper position was not found")
         item = {"id": uuid.uuid4().hex, "position_id": position_id,
                 "symbol": symbol.upper() if symbol else None, "note": note.strip()[:4000], "created_at": _now()}
-        with self._lock, self._connect() as db:
+        with self._lock, self._database() as db:
             db.execute("INSERT INTO journal_notes VALUES (?,?,?,?,?)", tuple(item.values()))
         return item

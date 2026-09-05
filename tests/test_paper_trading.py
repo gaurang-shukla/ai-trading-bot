@@ -209,3 +209,118 @@ def test_close_button_stops_navigation_and_quantity_is_bounded():
     assert "event.preventDefault();event.stopPropagation()" in close_handler
     assert "<td>${quantity(x.quantity)}</td>" in javascript
     assert "Math.abs(n)>=1?4:Math.abs(n)>=.001?6:8" in javascript
+
+
+def test_multiple_trades_reserve_cash_and_reconcile_equity(tmp_path: Path):
+    store = PaperStore(tmp_path / "account-math.db", starting_cash=10_000)
+    long = open_trade(store, "LONG", 100, 1_000)
+    short = store.open_position(
+        market="equities", symbol="SHORTTEST", display_name="Short Test", side="SHORT",
+        price=200, notional=2_000, signal={"side": "SELL", "confidence": .7},
+        risk_plan={"stop_loss": 220, "take_profit": 170},
+    )
+    assert store.account()["cash_balance"] == 7_000
+    store.mark(long["id"], 110)
+    store.mark(short["id"], 180)
+    assert store.account()["unrealized_pnl"] == pytest.approx(300)
+    assert store.account()["equity"] == pytest.approx(10_300)
+    store.close_position(long["id"], 110)
+    store.close_position(short["id"], 220)
+    account = store.account()
+    assert account["cash_balance"] == pytest.approx(9_900)
+    assert account["equity"] == pytest.approx(9_900)
+    assert account["realized_pnl"] == pytest.approx(-100)
+    assert account["win_rate"] == 50
+    assert account["closed_trades_count"] == 2
+
+
+def test_duplicate_position_and_second_close_are_blocked(tmp_path: Path):
+    store = PaperStore(tmp_path / "lifecycle.db")
+    position = open_trade(store)
+    with pytest.raises(ValueError, match="already exists"):
+        open_trade(store)
+    store.close_position(position["id"], 100)
+    with pytest.raises(KeyError):
+        store.close_position(position["id"], 100)
+    assert store.account()["cash_balance"] == 100_000
+    assert store.account()["closed_trades_count"] == 1
+
+
+def test_tiny_prices_and_non_finite_numbers_are_handled(tmp_path: Path):
+    store = PaperStore(tmp_path / "tiny.db")
+    position = open_trade(store, price=1e-12, notional=1_000)
+    assert position["quantity"] == pytest.approx(1e15)
+    for bad in (float("nan"), float("inf"), -1):
+        with pytest.raises(ValueError):
+            store.mark(position["id"], bad)
+
+
+def test_signal_snapshot_preserves_trade_context_but_removes_secrets(tmp_path: Path):
+    store = PaperStore(tmp_path / "secrets.db")
+    position = store.open_position(
+        market="equities", symbol="SAFE", display_name="Safe", side="LONG", price=10,
+        notional=100, signal={"side": "BUY", "api_key": "do-not-store", "nested": {"token": "no"}},
+        risk_plan={"stop_loss": 9, "take_profit": 12, "authorization": "Bearer no"},
+    )
+    encoded = __import__("json").dumps(position["signal_snapshot"])
+    assert "do-not-store" not in encoded and "Bearer no" not in encoded
+    assert position["stop_loss"] == 9 and position["take_profit"] == 12
+
+
+def test_duplicate_watchlist_keeps_single_original_entry(tmp_path: Path):
+    store = PaperStore(tmp_path / "watch.db")
+    first = store.add_watchlist({"market": "forex", "symbol": "eurusd", "display_name": "EUR/USD"})
+    second = store.add_watchlist({"market": "forex", "symbol": "EURUSD", "display_name": "Euro / Dollar"})
+    assert len(store.watchlist()) == 1
+    assert second["added_at"] == first["added_at"]
+    assert second["display_name"] == "Euro / Dollar"
+
+
+def test_banknifty_paper_api_is_research_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SIGNAL_DB_PATH", str(tmp_path / "banknifty-paper.db"))
+    response = TestClient(create_app()).post("/api/paper/positions", json={
+        "market": "banknifty_options", "symbol": "BANKNIFTY", "notional_amount": 1_000,
+    })
+    assert response.status_code == 409
+    assert "research-only" in response.json()["detail"]
+
+
+def test_frontend_guards_paper_mutations_against_double_submit():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    assert "if(confirm.disabled)return;confirm.disabled=true" in javascript
+    assert "if(b.disabled)return;b.disabled=true" in javascript
+    assert "if(submit.disabled)return;submit.disabled=true" in javascript
+    assert "friendlyPaperError" in javascript
+    assert "['Closed trades',account.closed_trades_count,'count']" in javascript
+
+
+def test_corrupt_database_is_quarantined_without_overwriting_it(tmp_path: Path):
+    path = tmp_path / "broken" / "signal.db"
+    path.parent.mkdir()
+    original = b"not a sqlite database"
+    path.write_bytes(original)
+    store = PaperStore(path)
+    assert store.account()["cash_balance"] == 100_000
+    assert store.recovered_database is not None
+    assert store.recovered_database.read_bytes() == original
+
+
+def test_separate_stores_serialize_cash_reservations(tmp_path: Path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "concurrent.db"
+    stores = [PaperStore(path, starting_cash=1_000) for _ in range(2)]
+
+    def attempt(index):
+        try:
+            return stores[index].open_position(
+                market="equities", symbol=f"RACE{index}", display_name="Race", side="LONG",
+                price=10, notional=750, signal={"side": "BUY"}, risk_plan={},
+            )
+        except ValueError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(attempt, range(2)))
+    assert sum(result is not None for result in results) == 1
+    assert PaperStore(path).account()["cash_balance"] == 250
