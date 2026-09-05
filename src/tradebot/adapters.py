@@ -24,6 +24,26 @@ INDIAN_RESEARCH_SYMBOLS = {
 logger = logging.getLogger(__name__)
 
 
+WEEX_RATIO_CHANGE_FIELDS = ("change", "changeRate", "riseFallRate", "change_rate")
+WEEX_PERCENT_CHANGE_FIELDS = ("priceChangePercent", "changePercent")
+WEEX_CHANGE_FIELDS = WEEX_RATIO_CHANGE_FIELDS + WEEX_PERCENT_CHANGE_FIELDS
+
+
+def weex_change_details(row: dict) -> tuple[str | None, object, float | None]:
+    """Return the selected WEEX change field, its raw value, and percentage points."""
+    field = next((name for name in WEEX_CHANGE_FIELDS if row.get(name) is not None), None)
+    if field is None:
+        return None, None, None
+    raw = row[field]
+    ratio = field in WEEX_RATIO_CHANGE_FIELDS
+    if isinstance(raw, str) and raw.strip().endswith("%"):
+        value = _optional_float(raw.strip()[:-1])
+        ratio = False
+    else:
+        value = _optional_float(raw)
+    return field, raw, value * 100 if value is not None and ratio else value
+
+
 def normalize_weex_24h_change(row: dict) -> float | None:
     """Normalize WEEX's field-specific 24-hour change formats to percentage points.
 
@@ -31,17 +51,22 @@ def normalize_weex_24h_change(row: dict) -> float | None:
     fields are already expressed in percentage points. A literal percent suffix
     is unambiguous regardless of which field supplied it.
     """
-    field = next((name for name in ("change", "changeRate", "riseFallRate", "change_rate",
-                                    "priceChangePercent", "changePercent")
-                  if row.get(name) is not None), None)
-    if field is None:
-        return None
-    raw = row[field]
-    ratio = field in {"change", "changeRate", "riseFallRate", "change_rate"}
-    if isinstance(raw, str) and raw.strip().endswith("%"):
-        raw, ratio = raw.strip()[:-1], False
-    value = _optional_float(raw)
-    return value * 100 if value is not None and ratio else value
+    return weex_change_details(row)[2]
+
+
+def normalize_weex_ticker_row(row: dict, provider_market: str) -> dict:
+    """Normalize a raw bulk-ticker row once, at the WEEX provider boundary."""
+    field, raw, normalized = weex_change_details(row)
+    result = dict(row)
+    result["change"] = normalized
+    result["_weex_change_normalized"] = True
+    result["_weex_debug"] = {
+        "provider_market": provider_market,
+        "raw_change_field": field,
+        "raw_change_value": raw,
+        "normalized_change_percent": normalized,
+    }
+    return result
 
 
 def research_symbol(symbol: str) -> str:
@@ -235,22 +260,39 @@ class _WeexPublicClient:
             return datetime.now(timezone.utc).isoformat()
         return datetime.fromtimestamp(int(value) / 1000, timezone.utc).isoformat()
 
+    @staticmethod
+    def _ticker_payload_rows(payload: dict | list) -> list[dict]:
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+        if not isinstance(payload, dict):
+            return []
+        rows = payload.get("data", payload.get("result", payload))
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+        return [rows] if isinstance(rows, dict) else []
+
 
 class WeexSpotMarketData(_WeexPublicClient):
     base_url = "https://api-spot.weex.com"
 
     def snapshot(self, symbol: str) -> MarketSnapshot:
         payload = self._get("/api/v3/market/ticker/24hr", {"symbol": symbol.upper()})
-        row = payload[0] if isinstance(payload, list) else payload
+        rows = self._ticker_payload_rows(payload)
+        if not rows:
+            raise ValueError(f"WEEX spot returned no ticker for {symbol}")
+        row = rows[0]
         return MarketSnapshot(symbol.upper(), float(row["lastPrice"]),
                               self._timestamp(row.get("closeTime")), "weex_spot_v3",
                               normalize_weex_24h_change(row),
                               _optional_float(row.get("quoteVolume") or row.get("volume")), None,
                               _ticker_volatility(row))
 
-    def tickers(self) -> list[dict]:
+    def raw_tickers(self) -> list[dict]:
         payload = self._get("/api/v3/market/ticker/24hr", {})
-        return payload if isinstance(payload, list) else [payload]
+        return self._ticker_payload_rows(payload)
+
+    def tickers(self) -> list[dict]:
+        return [normalize_weex_ticker_row(row, "crypto_spot") for row in self.raw_tickers()]
 
     def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
         payload = self._get("/api/v3/market/klines", {"symbol": symbol.upper(),
@@ -263,7 +305,10 @@ class WeexFuturesMarketData(_WeexPublicClient):
 
     def snapshot(self, symbol: str) -> MarketSnapshot:
         payload = self._get("/capi/v3/market/ticker/24hr", {"symbol": symbol.upper()})
-        row = payload[0] if isinstance(payload, list) else payload
+        rows = self._ticker_payload_rows(payload)
+        if not rows:
+            raise ValueError(f"WEEX futures returned no ticker for {symbol}")
+        row = rows[0]
         price = row.get("lastPrice") or row.get("last") or row.get("markPrice") or row.get("price")
         return MarketSnapshot(symbol.upper(), float(price),
                               self._timestamp(row.get("closeTime") or row.get("time")), "weex_futures_v3",
@@ -276,9 +321,12 @@ class WeexFuturesMarketData(_WeexPublicClient):
         payload = self._get("/capi/v3/market/apiTradingSymbols", {})
         return [str(symbol) for symbol in payload]
 
-    def tickers(self) -> list[dict]:
+    def raw_tickers(self) -> list[dict]:
         payload = self._get("/capi/v3/market/ticker/24hr", {})
-        return payload if isinstance(payload, list) else [payload]
+        return self._ticker_payload_rows(payload)
+
+    def tickers(self) -> list[dict]:
+        return [normalize_weex_ticker_row(row, "crypto_futures") for row in self.raw_tickers()]
 
     def candles(self, symbol: str, interval: str, limit: int = 250) -> list[Candle]:
         payload = self._get("/capi/v3/market/klines", {"symbol": symbol.upper(),

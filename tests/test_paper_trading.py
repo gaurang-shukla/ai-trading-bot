@@ -376,6 +376,34 @@ def test_dashboard_names_capital_and_status_fields():
     assert "['Cash balance'" not in javascript
 
 
+def test_recent_exits_are_visible_before_open_positions_with_complete_history():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    assert javascript.index("Recent paper exits") < javascript.index("OPEN POSITIONS")
+    assert "paperTradeTable(trades.slice(0,5)" in javascript
+    assert "Amount invested / Exit value" in javascript
+    assert "Realized P&amp;L" in javascript
+    assert "Status / Reason" in javascript
+    assert "Opened / Closed" in javascript
+
+
+@pytest.mark.parametrize(("reason", "label"), [
+    ("stop_loss", "Closed by stop loss"),
+    ("take_profit", "Closed by take profit"),
+    ("manual", "Closed manually"),
+])
+def test_closed_trade_history_preserves_reason_values_and_amounts(tmp_path, reason, label):
+    store = PaperStore(tmp_path / f"history-{reason}.db")
+    position = open_trade(store)
+    trade = store.close_position(position["id"], 95, reason)
+    history = store.trades()
+    assert len(history) == store.account()["closed_trades_count"] == 1
+    assert history[0]["close_reason"] == reason
+    assert history[0]["position_status"] == label
+    assert history[0]["amount_invested"] == trade["entry_notional"] == 1_000
+    assert history[0]["exit_value"] == trade["exit_value"]
+    assert history[0]["signal_snapshot"]
+
+
 @pytest.mark.parametrize(("mark", "reason", "exit_price"), [
     (80, "stop_loss", 90), (130, "take_profit", 120),
 ])

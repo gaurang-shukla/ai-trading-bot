@@ -60,15 +60,21 @@ def _ticker_rows(raw: list[dict]) -> list[dict]:
         try:
             symbol = str(item.get("symbol", "")).upper()
             price = float(item.get("lastPrice") or item.get("last") or 0)
-            change = normalize_weex_24h_change(item)
+            # Bulk WEEX adapters normalize at their boundary.  Retain support for
+            # raw rows supplied by older/custom clients without multiplying twice.
+            change = (item.get("change") if item.get("_weex_change_normalized")
+                      else normalize_weex_24h_change(item))
             change = 0.0 if change is None else change
             high = float(item.get("highPrice") or item.get("high_24h") or price)
             low = float(item.get("lowPrice") or item.get("low_24h") or price)
             volume = float(item.get("quoteVolume") or item.get("quoteVolume_24h") or item.get("volume_24h") or 0)
             if symbol and price > 0:
-                rows.append({"symbol": symbol, "price": price, "change": change,
+                row = {"symbol": symbol, "price": price, "change": change,
                              "high": high, "low": low, "volume": volume,
-                             "volatility": abs(high - low) / price * 100})
+                             "volatility": abs(high - low) / price * 100}
+                if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
+                    row.update(item.get("_weex_debug") or {})
+                rows.append(row)
         except (TypeError, ValueError):
             continue
     return rows
