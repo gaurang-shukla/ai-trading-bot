@@ -826,7 +826,7 @@ def create_app() -> FastAPI:
         try:
             return paper.open_position(market=request.market.value, symbol=request.symbol,
                     display_name=quick.get("display_name") or request.symbol.upper(), side=side,
-                    price=price, notional=notional, signal=quick["signal"], risk_plan=plan)
+                    price=price, notional=notional, signal=quick, risk_plan=plan)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -852,6 +852,28 @@ def create_app() -> FastAPI:
     @app.get("/api/paper/trades")
     def paper_trades():
         return paper.trades()
+
+    @app.get("/api/paper/reviews")
+    def paper_reviews(symbol: str | None = None):
+        return paper.reviews(symbol=symbol)
+
+    @app.get("/api/paper/reviews/{trade_id}")
+    def paper_review(trade_id: str):
+        reviews = paper.reviews(trade_id=trade_id)
+        if not reviews:
+            raise HTTPException(404, "Paper review not found")
+        return reviews[0]
+
+    @app.post("/api/paper/reviews/{trade_id}/regenerate")
+    def regenerate_paper_review(trade_id: str):
+        try:
+            return paper.regenerate_review(trade_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Closed paper trade not found") from exc
+
+    @app.get("/api/paper/learning")
+    def paper_learning(symbol: str | None = None):
+        return paper.learning(symbol=symbol)
 
     @app.get("/api/paper/watchlist")
     def paper_watchlist():
