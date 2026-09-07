@@ -89,11 +89,13 @@ def advanced_research_availability(request: "AnalyzeRequest", quick: dict) -> di
         return unavailable("provider_required",
                            "Advanced Research requires a configured live option-chain provider.",
                            action="Connect a live option-chain provider")
-    if request.market is MarketKind.INDIAN_INDICES:
+    # The Indian market bucket contains both cash equities and indices.  Keep
+    # provider-required option-chain handling isolated to BANKNIFTY_OPTIONS above.
+    if request.market is MarketKind.INDIAN_INDICES and not original.endswith(".NS"):
         return unavailable(
-            "unsupported_market",
-            "Advanced Research is not available for Indian index symbols yet. "
-            "Use Quick Signal and Fast AI Explanation.",
+            "unsupported_symbol",
+            "Advanced Research is not available for this Indian index symbol yet. "
+            "Quick Signal and Fast AI Explanation remain available.",
         )
     if request.market is MarketKind.COMMODITIES:
         return unavailable("unsupported_market",
@@ -180,9 +182,10 @@ def _deep_failure_from_notice(notice: str, attempted_symbol: str) -> DeepResearc
         import re
         match = re.search(r"latest row is (\d{4}-\d{2}-\d{2})", notice, re.I)
         stale_date = match.group(1) if match else None
-    message = (f"Advanced Research is unavailable because the external research provider returned stale data for "
-               f"{attempted_symbol}. Quick Signal remains available." if stale else
-               "Advanced Research is unavailable for this symbol right now. Quick Signal remains available.")
+    message = (f"Advanced Research needs fresher external data for {attempted_symbol}. "
+               "Quick Signal remains available. Fast AI Explanation remains available." if stale else
+               f"Advanced Research is temporarily unavailable because external data for "
+               f"{attempted_symbol} is unavailable. Quick Signal remains available. Fast AI Explanation remains available.")
     can_retry = category not in {"stale_external_data", "unsupported_symbol", "insufficient_candles"}
     return DeepResearchUnavailable(message, category, can_retry=can_retry,
         retry_recommended=can_retry and category in {"openai_timeout", "tradingagents_timeout", "provider_unavailable"},

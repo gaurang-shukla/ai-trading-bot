@@ -78,9 +78,9 @@ def test_missing_indian_index_candles_fall_back_to_quick_signal_without_openai()
     assert result['signal']
     availability = result['advanced_research_availability']
     assert availability['advanced_research_available'] is False
-    assert availability['availability_status'] == 'unsupported_market'
+    assert availability['availability_status'] == 'unsupported_symbol'
     assert availability['recommended_action'] == 'Use Quick Signal and Fast AI Explanation'
-    assert 'Indian index symbols' in availability['availability_reason']
+    assert 'this Indian index symbol' in availability['availability_reason']
     assert 'option-chain' not in availability['availability_reason']
     assert result['notice'].startswith('Deterministic quick signal')
     assert len(result['warnings']) == 4

@@ -39,11 +39,11 @@ def test_gold_and_banknifty_index_have_specific_preflight_states():
     assert "commodity symbol" in gold["availability_reason"]
     assert "TradingAgents" in gold["availability_reason"]
     bank = availability(MarketKind.INDIAN_INDICES, "BANKNIFTY")
-    assert bank["availability_status"] == "unsupported_market"
+    assert bank["availability_status"] == "unsupported_symbol"
     assert bank["recommended_action"] == "Use Quick Signal and Fast AI Explanation"
     assert bank["availability_reason"] == (
-        "Advanced Research is not available for Indian index symbols yet. "
-        "Use Quick Signal and Fast AI Explanation."
+        "Advanced Research is not available for this Indian index symbol yet. "
+        "Quick Signal and Fast AI Explanation remain available."
     )
     assert "option-chain" not in bank["availability_reason"]
 
@@ -60,9 +60,33 @@ def test_only_banknifty_options_requires_an_option_chain_provider():
     mapped_index = advanced_research_availability(
         mapped_request, {"signal": {"side": "HOLD"}}
     )
-    assert mapped_index["availability_status"] == "unsupported_market"
+    assert mapped_index["availability_status"] == "unsupported_symbol"
     assert "option-chain" not in mapped_index["availability_reason"]
 
+
+
+def test_indian_equities_are_not_classified_as_indices_or_options():
+    for symbol in ("ICICIBANK.NS", "HDFCBANK.NS", "SBIN.NS", "RELIANCE.NS", "TCS.NS"):
+        state = availability(MarketKind.INDIAN_INDICES, symbol)
+        assert state["advanced_research_available"] is True
+        assert state["availability_status"] == "available"
+        assert state["attempted_symbol"] == symbol
+        assert state["availability_status"] != "provider_required"
+        assert "option-chain" not in state["availability_reason"]
+        assert "Indian index symbol" not in state["availability_reason"]
+
+
+def test_frontend_resumes_and_auto_polls_deep_research_jobs():
+    javascript = TestClient(app).get("/assets/app.js").text
+    assert "resumeDeepJob(market,symbol)" in javascript
+    assert "sessionStorage.getItem(`deep-job:${key}`)" in javascript
+    assert "scheduleDeepPoll(jobId,market,symbol,key)" in javascript
+    assert "2500" in javascript
+    assert "clearDeepJob(key)" in javascript
+    assert "if(job.status==='completed')" in javascript
+    assert "Check status" in javascript
+    assert "Date.now()-waitStarted" not in javascript
+    assert "Could not check Advanced Research status:" not in javascript
 
 def test_quick_refresh_records_completion_time_separately_from_old_provider_time():
     old_market_time = "2020-01-01T00:00:00Z"
