@@ -64,6 +64,53 @@ def _clean_side(value) -> str:
     return text.removeprefix("SIDE.")
 
 
+def advanced_research_availability(request: "AnalyzeRequest", quick: dict) -> dict:
+    """Return the stable, user-facing eligibility contract for deep research."""
+    original = request.symbol.upper()
+    attempted = research_symbol(original)
+    metadata = asset_metadata(request.market, original)
+    common = {"market": request.market.value, "symbol": original,
+              "display_symbol": metadata.display_name, "provider": "TradingAgents external provider",
+              "quick_signal_available": bool(quick and quick.get("signal")),
+              "advanced_research_available": True, "availability_status": "available",
+              "availability_reason": "Advanced Research is available for this symbol.",
+              "failure_category": None, "can_retry": True,
+              "recommended_action": "Run Advanced Research",
+              "attempted_symbol": attempted}
+
+    def unavailable(status: str, reason: str, retry: bool = False, action: str | None = None):
+        return {**common, "advanced_research_available": False,
+                "availability_status": status, "availability_reason": reason,
+                "failure_category": status, "can_retry": retry,
+                "recommended_action": action or "Use Quick Signal and Fast AI Explanation"}
+
+    if request.market is MarketKind.BANKNIFTY_OPTIONS or (
+            request.market is MarketKind.INDIAN_INDICES and original == "BANKNIFTY"):
+        return unavailable("provider_required",
+                           "Advanced Research requires a configured live option-chain provider.",
+                           action="Connect a live option-chain provider")
+    if request.market is MarketKind.COMMODITIES:
+        return unavailable("unsupported_market",
+                           "Advanced Research is not available for this commodity symbol yet. TradingAgents does not support this market.")
+    if request.market is MarketKind.FOREX:
+        return unavailable("unsupported_market",
+                           "Advanced Research is not available for this forex symbol yet. TradingAgents does not support this market.")
+    if request.market in {MarketKind.CRYPTO_SPOT, MarketKind.CRYPTO_FUTURES}:
+        defaults = "BTC,ETH,SOL,LINK,XRP,DOGE,ADA,BNB,AVAX,DOT,LTC,BCH"
+        supported = {item.strip().upper() for item in
+                     os.getenv("TRADINGAGENTS_SUPPORTED_CRYPTO", defaults).split(",") if item.strip()}
+        base = original.replace("/", "").split(":", 1)[0]
+        for quote_currency in ("USDT", "USDC", "USD"):
+            if base.endswith(quote_currency):
+                base = base[:-len(quote_currency)]
+                break
+        if base not in supported:
+            pair = original[:-4] + "/USDT" if original.endswith("USDT") else original
+            return unavailable("unsupported_symbol",
+                               f"Advanced Research is not available for {pair}: external symbol {attempted} is not supported with verified fresh data. Quick Signal is using live WEEX data and remains available.")
+    return common
+
+
 def _deep_preflight(request: "AnalyzeRequest", quick: dict) -> dict:
     """Describe and validate the market-data route before TradingAgents is called.
 
@@ -72,6 +119,12 @@ def _deep_preflight(request: "AnalyzeRequest", quick: dict) -> dict:
     mapped USD instrument is known to be covered; exchange-only coins are skipped
     rather than silently substituted with an old Yahoo listing.
     """
+    availability = advanced_research_availability(request, quick)
+    if not availability["advanced_research_available"]:
+        raise DeepResearchUnavailable(
+            availability["availability_reason"], availability["failure_category"],
+            can_retry=availability["can_retry"], retry_recommended=availability["can_retry"],
+            source_used=availability["provider"], attempted_symbol=availability["attempted_symbol"])
     original = request.symbol.upper()
     attempted = research_symbol(original)
     candles = quick.get("chart_timeframes") or {}
@@ -99,25 +152,6 @@ def _deep_preflight(request: "AnalyzeRequest", quick: dict) -> dict:
             "latest_candle_timestamp": latest, "candle_age_seconds": candle_age,
             "external_symbol_supported": True, "external_data_fresh": None,
             "research_data_path": "mapped_external_symbol", "source_used": "TradingAgents external provider"}
-    if request.market not in {MarketKind.CRYPTO_SPOT, MarketKind.CRYPTO_FUTURES}:
-        return info
-    # Explicitly conservative until TradingAgents supports injected WEEX OHLCV.
-    defaults = "BTC,ETH,SOL,LINK,XRP,DOGE,ADA,BNB,AVAX,DOT,LTC,BCH"
-    supported = {item.strip().upper() for item in
-                 os.getenv("TRADINGAGENTS_SUPPORTED_CRYPTO", defaults).split(",") if item.strip()}
-    base = original.replace("/", "").split(":", 1)[0]
-    for quote_currency in ("USDT", "USDC", "USD"):
-        if base.endswith(quote_currency):
-            base = base[:-len(quote_currency)]
-            break
-    if base not in supported:
-        info["external_symbol_supported"] = False
-        pair = original[:-4] + "/USDT" if original.endswith("USDT") else original
-        raise DeepResearchUnavailable(
-            f"Advanced Research is unavailable for {pair} because its external research symbol "
-            f"({attempted}) is not supported with verified fresh data. Quick Signal is using live "
-            "WEEX data and remains available.", "unsupported_symbol", can_retry=False,
-            retry_recommended=False, source_used=info["source_used"], attempted_symbol=attempted)
     return info
 
 
@@ -561,7 +595,9 @@ def create_app() -> FastAPI:
             result.update(public_metadata(request.market, symbol))
             result.update({"live_price": snapshot.price, "change_24h": snapshot.change_24h,
                            "volume": snapshot.volume, "source": snapshot.source,
-                           "last_updated": snapshot.as_of})
+                           "last_updated": snapshot.as_of,
+                           "provider_data_timestamp": snapshot.as_of,
+                           "setup_refreshed_at": datetime.now(timezone.utc).isoformat()})
             # Send the candles already fetched for signal generation to the client.
             # This makes timeframe changes instant and avoids a second provider call.
             result["chart_timeframes"] = {
@@ -582,6 +618,9 @@ def create_app() -> FastAPI:
             if warnings:
                 result["warnings"] = warnings
             result["notice"] = "Deterministic quick signal only. No AI or live order was used."
+            result["stale_after_seconds"] = (90 if request.market in {
+                MarketKind.CRYPTO_SPOT, MarketKind.CRYPTO_FUTURES} else 600)
+            result["advanced_research_availability"] = advanced_research_availability(request, result)
             quick_results.put(request.market.value, symbol, result)
             return result
         except Exception as exc:
@@ -621,8 +660,19 @@ def create_app() -> FastAPI:
                 "ai_explanation": ai_explanation, "what_to_watch_next": watch,
                 "fallback_used": fallback_used, "ai_mode": "fast_explanation"}
 
+    @app.post("/api/analyze/deep/availability")
+    def deep_availability(request: AnalyzeRequest):
+        """Preflight deep research without starting providers or an AI job."""
+        quick = quick_results.get(request.market.value, request.symbol) or {}
+        return advanced_research_availability(request, quick)
+
     @app.post("/api/analyze/deep")
     def deep_analyze(request: DeepAnalyzeRequest):
+        cached_quick = quick_results.get(request.market.value, request.symbol) or {}
+        availability = advanced_research_availability(request, cached_quick)
+        if cached_quick and not availability["advanced_research_available"]:
+            return {"status": "skipped", **availability,
+                    "user_friendly_error": availability["availability_reason"]}
         quick_context = {}
 
         def perform(progress):
