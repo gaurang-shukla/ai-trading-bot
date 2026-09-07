@@ -3,12 +3,14 @@ import json
 from io import BytesIO
 from unittest.mock import Mock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tradebot.analysis import (DeepAnalysisCache, DeepJobRegistry, FastAIExplainer,
                                QuickSignalEngine, ensure_risk_plan, normalize_deep_reasoning)
-from tradebot.app import app
-from tradebot.models import Candle, MarketSnapshot, Side, TradeSignal
+from tradebot.app import (_deep_failure_from_notice, _deep_preflight, app,
+                          AnalyzeRequest, DeepResearchUnavailable)
+from tradebot.models import Candle, MarketKind, MarketSnapshot, Side, TradeSignal
 
 
 def snapshot():
@@ -102,6 +104,42 @@ def test_deep_results_are_cached_by_market_and_symbol():
     assert second["cached"] is True
     assert second["deep_analyzed_at"] == first["deep_analyzed_at"]
     assert run.call_count == 2
+
+
+def test_weex_exchange_only_symbol_is_skipped_before_external_mapping():
+    request = AnalyzeRequest(market=MarketKind.CRYPTO_SPOT, venue="weex", symbol="STONKUSDT")
+    quick = {"source": "weex_spot_v3", "last_updated": "2026-09-07T00:00:00Z",
+             "display_name": "STONK/USDT", "chart_timeframes": {"1h": []}}
+    with pytest.raises(DeepResearchUnavailable) as caught:
+        _deep_preflight(request, quick)
+    failure = caught.value.deep_failure
+    assert failure["failure_category"] == "unsupported_symbol"
+    assert failure["attempted_symbol"] == "STONK-USD"
+    assert failure["can_retry"] is False
+    assert "live WEEX data" in failure["user_friendly_error"]
+
+
+def test_stale_external_failure_is_structured_and_not_retryable():
+    error = _deep_failure_from_notice(
+        "NoMarketDataError: latest row is 2022-08-17 (stale)", "STONK-USD")
+    failure = error.deep_failure
+    assert failure["failure_category"] == "stale_external_data"
+    assert failure["stale_data_date"] == "2022-08-17"
+    assert failure["can_retry"] is False
+
+
+def test_deep_poll_payload_removes_chart_arrays():
+    jobs = DeepJobRegistry(ttl_seconds=60)
+    started = jobs.start("crypto_futures", "COMPACTUSDT", lambda _progress: {
+        "signal": {"side": "HOLD"}, "chart_timeframes": {"1h": [{"close": 1}]},
+        "chart_points": [{"close": 1}], "quick_signal": {"chart_timeframes": {"1h": []}}
+    }, lambda: {})
+    deadline = time.monotonic() + 1
+    while jobs.get(started["job_id"])["status"] in {"queued", "running"} and time.monotonic() < deadline:
+        time.sleep(.01)
+    result = jobs.get(started["job_id"])["result"]
+    assert "chart_timeframes" not in result and "chart_points" not in result
+    assert "chart_timeframes" not in result["quick_signal"]
 
 
 def test_deep_ai_failure_does_not_replace_quick_signal_ui():

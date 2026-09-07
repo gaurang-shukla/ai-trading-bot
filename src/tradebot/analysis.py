@@ -382,7 +382,7 @@ class DeepJobRegistry:
     """Process-local Deep AI jobs with de-duplication and completed-result caching."""
 
     ACTIVE = {"queued", "running"}
-    TERMINAL = {"completed", "failed", "timed_out"}
+    TERMINAL = {"completed", "failed", "skipped", "timed_out"}
     STEPS = (
         "Preparing market data", "Checking technical indicators",
         "Running TradingAgents research", "Building plain-language summary",
@@ -419,6 +419,10 @@ class DeepJobRegistry:
                    "completed_at": None, "progress_step": 0,
                    "progress_message": self.STEPS[0], "result": None,
                    "fallback_result": None, "user_friendly_error": None,
+                   "failure_category": None, "fallback_available": True,
+                   "can_retry": True, "retry_recommended": True,
+                   "source_used": None, "attempted_symbol": None,
+                   "stale_data_date": None,
                    "debug_error": None, "started_monotonic": time.monotonic()}
             self._jobs[job["job_id"]] = job
             self._latest[key] = job["job_id"]
@@ -437,23 +441,36 @@ class DeepJobRegistry:
                          progress_message=self.STEPS[-1], result=result,
                          completed_at=self._now(), completed_monotonic=time.monotonic())
         except FutureTimeoutError as exc:
-            message = "Advanced Deep Research reached its backend time limit. Quick Signal remains available."
-            self._terminal_error(job_id, "timed_out", message, exc, fallback)
+            message = ("Advanced Deep Research reached its backend time limit. "
+                       "Advanced Research timed out. Quick Signal remains available.")
+            self._terminal_error(job_id, "timed_out", message, exc, fallback,
+                                 failure_category="tradingagents_timeout")
         except Exception as exc:
-            message = "Advanced Deep Research could not complete. Quick Signal remains available."
-            self._terminal_error(job_id, "failed", message, exc, fallback)
+            details = getattr(exc, "deep_failure", {})
+            message = details.get("user_friendly_error") or (
+                "Advanced Research could not complete. Quick Signal remains available.")
+            self._terminal_error(job_id, details.get("status", "failed"), message, exc, fallback,
+                                 failure_category=details.get("failure_category", "tradingagents_error"),
+                                 **{key: details.get(key) for key in (
+                                     "can_retry", "retry_recommended", "source_used",
+                                     "attempted_symbol", "stale_data_date") if key in details})
         finally:
             # Running provider calls cannot safely be killed; do not block this worker.
             inner.shutdown(wait=False, cancel_futures=True)
 
     def _terminal_error(self, job_id: str, status: str, message: str, exc: Exception,
-                        fallback: Callable[[], dict]) -> None:
+                        fallback: Callable[[], dict], failure_category: str = "unknown_error",
+                        **details) -> None:
         try:
-            fallback_result = fallback()
+            fallback_result = _compact_deep_payload(fallback())
         except Exception:
             fallback_result = None
         fields = {"status": status, "completed_at": self._now(),
-                  "fallback_result": fallback_result, "user_friendly_error": message}
+                  "fallback_result": fallback_result, "user_friendly_error": message,
+                  "failure_category": failure_category,
+                  "fallback_available": fallback_result is not None,
+                  "can_retry": details.pop("can_retry", True),
+                  "retry_recommended": details.pop("retry_recommended", True), **details}
         if _signal_debug_enabled():
             fields["debug_error"] = f"{type(exc).__name__}: {exc}"
         self._update(job_id, **fields)
@@ -479,7 +496,25 @@ class DeepJobRegistry:
         result = {key: value for key, value in job.items()
                   if not key.endswith("_monotonic") and (key != "debug_error" or value)}
         result["elapsed_seconds"] = round(time.monotonic() - job["started_monotonic"], 1)
+        if not _signal_debug_enabled():
+            result.pop("debug_error", None)
+        if result.get("result"):
+            result["result"] = _compact_deep_payload(result["result"])
+        if result.get("fallback_result"):
+            result["fallback_result"] = _compact_deep_payload(result["fallback_result"])
         return result
+
+
+def _compact_deep_payload(payload: dict) -> dict:
+    """Remove candle arrays from polling responses; the Quick endpoint owns charts."""
+    compact = deepcopy(payload)
+    for key in ("chart_timeframes", "chart_points"):
+        compact.pop(key, None)
+    quick = compact.get("quick_signal")
+    if isinstance(quick, dict):
+        compact["quick_signal"] = {key: value for key, value in quick.items()
+                                   if key not in {"chart_timeframes", "chart_points"}}
+    return compact
 
 
 def _signal_debug_enabled() -> bool:
@@ -489,22 +524,19 @@ def _signal_debug_enabled() -> bool:
 def normalize_deep_reasoning(deep: dict, quick: dict) -> dict:
     """Keep good agent prose, but expand terse decisions using deterministic evidence."""
     signal = deep.setdefault("signal", {})
+    signal["side"] = str(getattr(signal.get("side"), "value", signal.get("side") or "HOLD")).upper().removeprefix("SIDE.")
     ensure_risk_plan(deep)
     rationale = str(signal.get("rationale") or deep.get("plain_language_reason") or "").strip()
-    if len(rationale.split()) >= 40 and rationale.upper() not in {"HOLD", "BUY", "SELL"}:
-        deep["plain_language_reason"] = rationale
-        if deep["risk_plan"]["explanation"] not in rationale:
-            rationale = f"{rationale}\n\nRisk plan: {deep['risk_plan']['explanation']}"
-            signal["rationale"] = rationale
-            deep["plain_language_reason"] = rationale
-        return deep
-
-    side = str(signal.get("side") or quick["signal"]["side"]).upper()
+    side = signal["side"]
     rows = quick.get("timeframe_breakdown") or []
     bullish = sum(row.get("trend") == "Bullish" for row in rows)
     bearish = sum(row.get("trend") == "Bearish" for row in rows)
     neutral = len(rows) - bullish - bearish
     mixed = not rows or (bullish and bearish) or neutral
+    why = ("Quick Signal found a short-term setup, but Advanced Research is more conservative "
+           "because confirmation is mixed and the risk/reward is not strong enough."
+           if side == "HOLD" and side != str(quick.get("signal", {}).get("side", "")).upper()
+           else f"The deeper review {'supports' if side == str(quick.get('signal', {}).get('side', '')).upper() else 'takes a more conservative view than'} the Quick Signal.")
     parts = [f"Decision summary: The result is {side} because " +
              ("bullish and bearish signals are mixed." if mixed else
               f"the available timeframes have a {'bullish' if bullish else 'bearish'} bias.")]
@@ -544,6 +576,25 @@ def normalize_deep_reasoning(deep: dict, quick: dict) -> dict:
     reason = "\n\n".join(parts)
     signal["rationale"] = reason
     deep["plain_language_reason"] = reason
+    evidence = []
+    if rows:
+        evidence.append(f"{bullish} bullish, {bearish} bearish, {neutral} neutral timeframe(s)")
+        evidence.append("MACD is mixed" if len(macd) > 1 else
+                        f"MACD is {next(iter(macd)).lower()}" if macd else "MACD unavailable")
+    if quick.get("volatility_summary"):
+        evidence.append(quick["volatility_summary"])
+    if levels.get("resistance") is not None:
+        evidence.append(f"Resistance is near {_display(levels['resistance'])}")
+    deep["advanced_summary"] = {
+        "decision": side,
+        "why_it_differs": why,
+        "key_evidence": evidence[:4],
+        "what_would_change": ["A clean breakout above resistance", "Momentum improves",
+                              "Volume confirms"] if side == "HOLD" else
+                             ["Timeframe alignment changes", "Price breaks a key level"],
+        "beginner_meaning": ("Watch it, but do not force a trade yet." if side == "HOLD" else
+                             "Treat this as a second opinion and keep using paper mode."),
+    }
     return ensure_risk_plan(deep)
 
 
