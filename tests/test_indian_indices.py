@@ -34,6 +34,18 @@ def test_bank_nifty_maps_to_research_symbol_but_preserves_identity():
     assert 'BANK NIFTY' in client.get('/assets/app.js').text
 
 
+def test_bank_nifty_index_asset_keeps_quick_and_fast_ai_without_options_ui():
+    javascript = client.get('/assets/app.js').text
+    asset_renderer = javascript.split('function renderAssetSetup', 1)[1].split(
+        'async function assetPage', 1)[0]
+
+    assert "signalPanel(quick,'QUICK SIGNAL · NO AI')" in asset_renderer
+    assert 'FAST AI EXPLANATION' in asset_renderer
+    assert 'Explain Quick Signal' in asset_renderer
+    assert 'OPTIONS PREPARATION' not in asset_renderer
+    assert 'option-chain research requires' not in asset_renderer
+
+
 def test_indian_indices_use_yahoo_then_openbb_and_never_weex():
     providers = MarketOverviewService()._providers(
         MarketKind.INDIAN_INDICES, 'BANKNIFTY')
@@ -63,6 +75,13 @@ def test_missing_indian_index_candles_fall_back_to_quick_signal_without_openai()
     result = response.json()
     assert result['fallback'] is True
     assert result['signal']['symbol'] == 'BANKNIFTY'
+    assert result['signal']
+    availability = result['advanced_research_availability']
+    assert availability['advanced_research_available'] is False
+    assert availability['availability_status'] == 'unsupported_market'
+    assert availability['recommended_action'] == 'Use Quick Signal and Fast AI Explanation'
+    assert 'Indian index symbols' in availability['availability_reason']
+    assert 'option-chain' not in availability['availability_reason']
     assert result['notice'].startswith('Deterministic quick signal')
     assert len(result['warnings']) == 4
     assert {call.args[1] for call in provider.candles.call_args_list} == {

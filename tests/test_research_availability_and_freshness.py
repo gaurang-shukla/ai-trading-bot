@@ -33,14 +33,35 @@ def test_temporary_provider_failure_is_retryable():
     assert failure["can_retry"] is True
 
 
-def test_gold_and_banknifty_have_specific_preflight_states():
+def test_gold_and_banknifty_index_have_specific_preflight_states():
     gold = availability(MarketKind.COMMODITIES, "GC")
     assert gold["failure_category"] == "unsupported_market"
     assert "commodity symbol" in gold["availability_reason"]
     assert "TradingAgents" in gold["availability_reason"]
     bank = availability(MarketKind.INDIAN_INDICES, "BANKNIFTY")
-    assert bank["availability_status"] == "provider_required"
-    assert bank["recommended_action"] == "Connect a live option-chain provider"
+    assert bank["availability_status"] == "unsupported_market"
+    assert bank["recommended_action"] == "Use Quick Signal and Fast AI Explanation"
+    assert bank["availability_reason"] == (
+        "Advanced Research is not available for Indian index symbols yet. "
+        "Use Quick Signal and Fast AI Explanation."
+    )
+    assert "option-chain" not in bank["availability_reason"]
+
+
+def test_only_banknifty_options_requires_an_option_chain_provider():
+    options = availability(MarketKind.BANKNIFTY_OPTIONS, "BANKNIFTY")
+    assert options["availability_status"] == "provider_required"
+    assert options["recommended_action"] == "Connect a live option-chain provider"
+
+    mapped_request = AnalyzeRequest.model_construct(
+        market=MarketKind.INDIAN_INDICES, symbol="^NSEBANK", venue="openbb", equity=100_000,
+        refresh=False,
+    )
+    mapped_index = advanced_research_availability(
+        mapped_request, {"signal": {"side": "HOLD"}}
+    )
+    assert mapped_index["availability_status"] == "unsupported_market"
+    assert "option-chain" not in mapped_index["availability_reason"]
 
 
 def test_quick_refresh_records_completion_time_separately_from_old_provider_time():

@@ -85,11 +85,16 @@ def advanced_research_availability(request: "AnalyzeRequest", quick: dict) -> di
                 "failure_category": status, "can_retry": retry,
                 "recommended_action": action or "Use Quick Signal and Fast AI Explanation"}
 
-    if request.market is MarketKind.BANKNIFTY_OPTIONS or (
-            request.market is MarketKind.INDIAN_INDICES and original == "BANKNIFTY"):
+    if request.market is MarketKind.BANKNIFTY_OPTIONS:
         return unavailable("provider_required",
                            "Advanced Research requires a configured live option-chain provider.",
                            action="Connect a live option-chain provider")
+    if request.market is MarketKind.INDIAN_INDICES:
+        return unavailable(
+            "unsupported_market",
+            "Advanced Research is not available for Indian index symbols yet. "
+            "Use Quick Signal and Fast AI Explanation.",
+        )
     if request.market is MarketKind.COMMODITIES:
         return unavailable("unsupported_market",
                            "Advanced Research is not available for this commodity symbol yet. TradingAgents does not support this market.")
