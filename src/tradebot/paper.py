@@ -137,9 +137,22 @@ class PaperStore:
                 db.execute("ALTER TABLE paper_trades ADD COLUMN entry_notional REAL")
             if "exit_value" not in trade_columns:
                 db.execute("ALTER TABLE paper_trades ADD COLUMN exit_value REAL")
+            for name in ("max_price", "min_price"):
+                if name not in position_columns:
+                    db.execute(f"ALTER TABLE paper_positions ADD COLUMN {name} REAL")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trade_reviews (
+                  trade_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, market TEXT NOT NULL,
+                  side TEXT NOT NULL, result TEXT NOT NULL, close_reason TEXT NOT NULL,
+                  realized_return_pct REAL NOT NULL, grade TEXT NOT NULL,
+                  trap_category TEXT, lesson TEXT NOT NULL, review_json TEXT NOT NULL,
+                  generated_at TEXT NOT NULL,
+                  FOREIGN KEY(trade_id) REFERENCES paper_trades(id)
+                )
+            """)
             db.execute("INSERT OR IGNORE INTO paper_account VALUES (1,?,?,0)",
                        (self.starting_cash, self.starting_cash))
-            db.execute("PRAGMA user_version=1")
+            db.execute("PRAGMA user_version=2")
 
     @staticmethod
     def pnl(side: str, entry: float, current: float, quantity: float) -> float:
@@ -199,7 +212,10 @@ class PaperStore:
     def mark(self, position_id: str, price: float) -> None:
         price = _positive_number(price, "Current price")
         with self._lock, self._database() as db:
-            db.execute("UPDATE paper_positions SET current_price=?,price_available=1 WHERE id=? AND status='open'", (price, position_id))
+            db.execute("UPDATE paper_positions SET current_price=?,price_available=1,"
+                       "max_price=MAX(COALESCE(max_price,entry_price),?),"
+                       "min_price=MIN(COALESCE(min_price,entry_price),?) "
+                       "WHERE id=? AND status='open'", (price, price, price, position_id))
 
     def mark_unavailable(self, position_id: str) -> None:
         """Retain the last valid price while making its stale/unavailable state explicit."""
@@ -230,15 +246,44 @@ class PaperStore:
         quantity = notional / price
         if not math.isfinite(quantity) or not (0 < quantity <= 1e18):
             raise ValueError("Calculated quantity is invalid")
+        # Callers may provide the complete Quick Signal result.  Keep the legacy
+        # signal-only contract working while producing one stable canonical snapshot.
+        quick = signal if isinstance(signal.get("signal"), dict) else {"signal": signal, "risk_plan": risk_plan}
+        source_signal = quick.get("signal") or signal
+        plan = quick.get("risk_plan") or risk_plan
+        levels = quick.get("key_levels") or {}
+        snapshot = _safe_snapshot({
+            "market": market, "symbol": symbol.upper(), "display_name": display_name,
+            "side": side, "source": "Quick Signal", "signal": source_signal,
+            "advanced_research_decision": quick.get("advanced_research_decision") or quick.get("deep_research"),
+            "entry_price": price, "stop_loss": plan.get("stop_loss"),
+            "take_profit": plan.get("take_profit"), "risk_score": plan.get("risk_score"),
+            "confidence": source_signal.get("confidence"),
+            "opportunity_score": quick.get("opportunity_score"),
+            "position_size_pct": plan.get("position_size_pct"), "amount_invested": notional,
+            "estimated_quantity": quantity, "setup_refreshed_at": quick.get("setup_refreshed_at") or quick.get("last_updated"),
+            "provider_data_timestamp": quick.get("provider_data_timestamp"),
+            "chart_timeframe": quick.get("chart_default_timeframe"),
+            "multi_timeframe_rows": quick.get("timeframe_breakdown") or [],
+            "support_level": levels.get("support") or quick.get("support_level"),
+            "resistance_level": levels.get("resistance") or quick.get("resistance_level"),
+            "atr_pct": quick.get("atr_pct") or (quick.get("volatility_summary") or {}).get("atr_pct"),
+            "rsi_summary": quick.get("rsi_summary") or (quick.get("momentum_summary") or {}).get("rsi"),
+            "macd_summary": quick.get("macd_summary") or (quick.get("momentum_summary") or {}).get("macd"),
+            "ema_bias_summary": quick.get("ema_bias_summary") or quick.get("trend_summary"),
+            "volume": quick.get("volume"), "change_24h": quick.get("change_24h"),
+            "funding_rate": quick.get("funding_rate"), "volatility": quick.get("volatility") or quick.get("volatility_summary"),
+            "reason": source_signal.get("rationale") or quick.get("plain_language_reason") or quick.get("reason"),
+            "risk_plan": plan,
+        })
         item = {"id": uuid.uuid4().hex, "market": market, "symbol": symbol.upper(),
                 "display_name": display_name, "side": side, "entry_price": price,
                 "current_price": price, "quantity": quantity, "notional_value": notional,
-                "stop_loss": risk_plan.get("stop_loss"), "take_profit": risk_plan.get("take_profit"),
-                "risk_score": risk_plan.get("risk_score"), "confidence": signal.get("confidence"),
-                "position_size_pct": risk_plan.get("position_size_pct"), "opened_at": _now(),
-                "source_signal_action": str(signal.get("side", "HOLD")), "status": "open",
-                "signal_snapshot": _safe_snapshot({"signal": signal, "risk_plan": risk_plan,
-                                                   "live_price": price})}
+                "stop_loss": plan.get("stop_loss"), "take_profit": plan.get("take_profit"),
+                "risk_score": plan.get("risk_score"), "confidence": source_signal.get("confidence"),
+                "position_size_pct": plan.get("position_size_pct"), "opened_at": _now(),
+                "source_signal_action": str(source_signal.get("side", "HOLD")), "status": "open",
+                "signal_snapshot": snapshot, "max_price": price, "min_price": price}
         with self._lock, self._database() as db:
             # BEGIN IMMEDIATE serializes the balance check across processes and
             # across multiple PaperStore instances, not only threads in this instance.
@@ -254,7 +299,8 @@ class PaperStore:
             if not db.execute("SELECT changes()").fetchone()[0]:
                 raise ValueError("Not enough paper cash")
             columns = ",".join(item)
-            values = list(item.values()); values[-1] = json.dumps(values[-1], default=str)
+            values = list(item.values())
+            values[list(item).index("signal_snapshot")] = json.dumps(item["signal_snapshot"], default=str)
             db.execute(f"INSERT INTO paper_positions ({columns}) VALUES ({','.join('?' for _ in item)})", values)
         position_id = item["id"]
         return next(position for position in self.positions() if position["id"] == position_id)
@@ -285,9 +331,189 @@ class PaperStore:
             db.execute("UPDATE paper_account SET cash_balance=cash_balance+?, realized_pnl=realized_pnl+? WHERE id=1",
                        (position["notional_value"] + profit, profit))
             db.execute(f"INSERT INTO paper_trades ({','.join(trade)}) VALUES ({','.join('?' for _ in trade)})", list(trade.values()))
+            review = self._build_review(trade, position)
+            self._save_review(db, review)
         trade["signal_snapshot"] = json.loads(trade["signal_snapshot"])
         trade["result"] = "win" if profit > 0 else "loss" if profit < 0 else "breakeven"
         return trade
+
+    @staticmethod
+    def _number(value: Any) -> float | None:
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            return None
+
+    def _build_review(self, trade: dict, position: dict | None = None) -> dict:
+        try:
+            snapshot = json.loads(trade.get("signal_snapshot") or "{}") if isinstance(trade.get("signal_snapshot"), str) else (trade.get("signal_snapshot") or {})
+        except (TypeError, json.JSONDecodeError):
+            snapshot = {}
+        pnl = float(trade["realized_pnl"])
+        result = "win" if pnl > 1e-9 else "loss" if pnl < -1e-9 else "breakeven"
+        entry, exit_price = float(trade["entry_price"]), float(trade["exit_price"])
+        amount = self._number(trade.get("entry_notional")) or entry * float(trade["quantity"])
+        return_pct = pnl / amount * 100 if amount else 0.0
+        opened = datetime.fromisoformat(str(trade["opened_at"]).replace("Z", "+00:00"))
+        closed = datetime.fromisoformat(str(trade["closed_at"]).replace("Z", "+00:00"))
+        atr = self._number(snapshot.get("atr_pct"))
+        change = self._number(snapshot.get("change_24h"))
+        stop = self._number(snapshot.get("stop_loss"))
+        resistance = self._number(snapshot.get("resistance_level"))
+        support = self._number(snapshot.get("support_level"))
+        rows = snapshot.get("multi_timeframe_rows") or []
+        labels = [str(row.get("signal") or row.get("trend") or row.get("bias") or "").lower() for row in rows if isinstance(row, dict)]
+        stale = False
+        refreshed = snapshot.get("setup_refreshed_at")
+        if refreshed:
+            try:
+                stale = (opened - datetime.fromisoformat(str(refreshed).replace("Z", "+00:00"))).total_seconds() > 900
+            except (ValueError, TypeError):
+                pass
+        traps = []
+        if result == "loss":
+            if change is not None and trade["side"] == "LONG" and change >= 8:
+                traps.extend(["late_entry_after_pump", "excessive_24h_move"])
+            if change is not None and trade["side"] == "SHORT" and change <= -8:
+                traps.append("excessive_24h_move")
+            if atr is not None and atr >= 4:
+                traps.append("high_atr_volatility")
+            if atr and stop is not None and abs(entry - stop) / entry * 100 < atr * .5:
+                traps.append("stop_too_tight")
+            bullish = sum(any(x in label for x in ("bull", "buy", "up")) for label in labels)
+            bearish = sum(any(x in label for x in ("bear", "sell", "down")) for label in labels)
+            if bullish and bearish:
+                traps.append("weak_multi_timeframe_confirmation")
+            if resistance and trade["side"] == "LONG" and 0 <= (resistance-entry)/entry*100 <= 1:
+                traps.append("nearby_resistance_for_long")
+            if support and trade["side"] == "SHORT" and 0 <= (entry-support)/entry*100 <= 1:
+                traps.append("nearby_support_for_short")
+            if stale:
+                traps.append("stale_setup")
+        traps = list(dict.fromkeys(traps))
+        primary_trap = traps[0] if traps else ("unknown" if result == "loss" else None)
+        confidence = self._number(snapshot.get("confidence"))
+        risk = self._number(snapshot.get("risk_score"))
+        if confidence is not None and confidence <= 1: confidence *= 100
+        if risk is not None and risk <= 1: risk *= 100
+        quality = max(0, min(100, (confidence if confidence is not None else 50) - (risk or 0) * .25 - len(traps) * 8))
+        grade = "A" if result == "win" and quality >= 70 else "B" if result == "win" else "C" if result == "breakeven" else "D" if quality >= 50 else "F"
+        lesson = (f"Paper setup worked and closed by {trade['close_reason'].replace('_', ' ')}; keep validating it with more samples."
+                  if result == "win" else
+                  f"Possible trap: {primary_trap.replace('_', ' ')}; use this as a filter candidate, not a trade command."
+                  if result == "loss" else "Paper trade finished near breakeven; review entry timing and costs.")
+        max_price = self._number((position or {}).get("max_price")); min_price = self._number((position or {}).get("min_price"))
+        favourable = adverse = None
+        if max_price is not None and min_price is not None:
+            favourable = ((max_price-entry) if trade["side"] == "LONG" else (entry-min_price)) / entry * 100
+            adverse = ((entry-min_price) if trade["side"] == "LONG" else (max_price-entry)) / entry * 100
+        return {"trade_id": trade["id"], "symbol": trade["symbol"], "market": trade["market"], "side": trade["side"],
+                "opened_at": trade["opened_at"], "closed_at": trade["closed_at"],
+                "holding_duration_seconds": max(0, (closed-opened).total_seconds()), "entry_price": entry,
+                "exit_price": exit_price, "amount_invested": amount,
+                "exit_value": self._number(trade.get("exit_value")) or amount+pnl, "realized_pnl": pnl,
+                "realized_return_pct": return_pct, "close_reason": trade["close_reason"], "result": result,
+                "did_follow_plan": "manual_review_required" if trade["close_reason"] == "manual" else "yes",
+                "expected_direction_correct": result == "win" if result != "breakeven" else "unknown",
+                "max_favourable_excursion_pct": favourable, "max_adverse_excursion_pct": adverse,
+                "setup_quality_score": round(quality, 1), "post_trade_grade": grade,
+                "trap_category": primary_trap, "trap_categories": traps, "one_line_lesson": lesson,
+                "detailed_review_notes": f"Deterministic paper review based only on the immutable entry snapshot. {lesson}",
+                "signal_snapshot": snapshot, "generated_at": _now()}
+
+    @staticmethod
+    def _save_review(db: sqlite3.Connection, review: dict) -> None:
+        db.execute("INSERT OR REPLACE INTO paper_trade_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (review["trade_id"], review["symbol"], review["market"], review["side"], review["result"],
+                    review["close_reason"], review["realized_return_pct"], review["post_trade_grade"],
+                    review["trap_category"], review["one_line_lesson"], json.dumps(_safe_snapshot(review), default=str), review["generated_at"]))
+
+    def reviews(self, trade_id: str | None = None, symbol: str | None = None) -> list[dict]:
+        query, params = "SELECT review_json FROM paper_trade_reviews", []
+        clauses = []
+        if trade_id: clauses.append("trade_id=?"); params.append(trade_id)
+        if symbol: clauses.append("symbol=?"); params.append(symbol.upper())
+        if clauses: query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY generated_at DESC"
+        with self._database() as db:
+            return [json.loads(row[0]) for row in db.execute(query, params)]
+
+    def regenerate_review(self, trade_id: str) -> dict:
+        with self._lock, self._database() as db:
+            row = db.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone()
+            if not row: raise KeyError(trade_id)
+            trade = dict(row)
+            position = db.execute("SELECT * FROM paper_positions WHERE id=?", (trade["position_id"],)).fetchone()
+            review = self._build_review(trade, dict(position) if position else None)
+            self._save_review(db, review)
+        return review
+
+    @staticmethod
+    def _bucket(value: float | None, ranges: list[tuple[float, float, str]]) -> str:
+        if value is None: return "unknown"
+        return next((label for low, high, label in ranges if low <= value < high), ranges[-1][2])
+
+    def learning(self, symbol: str | None = None) -> dict:
+        reviews = self.reviews(symbol=symbol)
+        returns = [float(x["realized_return_pct"]) for x in reviews]
+        wins = [x for x in reviews if x["result"] == "win"]
+        losses = [x for x in reviews if x["result"] == "loss"]
+        def grouped(key):
+            groups = {}
+            for review in reviews:
+                value = review.get(key)
+                if value is not None: groups.setdefault(str(value), []).append(review["realized_return_pct"])
+            return {name: {"trades": len(values), "average_return_pct": sum(values)/len(values),
+                           "win_rate": sum(v > 0 for v in values)/len(values)*100} for name, values in groups.items()}
+        def extremes(key):
+            values = grouped(key)
+            ordered = sorted(values, key=lambda name: values[name]["average_return_pct"], reverse=True)
+            return ((ordered[0] if ordered else None), (ordered[-1] if ordered else None))
+        bucketed = {"confidence": {}, "risk_score": {}, "atr": {}, "change_24h": {}, "timeframe_confirmation": {}}
+        for review in reviews:
+            snap = review.get("signal_snapshot") or {}
+            confidence = self._number(snap.get("confidence")); risk = self._number(snap.get("risk_score"))
+            if confidence is not None and confidence <= 1: confidence *= 100
+            if risk is not None and risk <= 1: risk *= 100
+            atr = self._number(snap.get("atr_pct")); change = self._number(snap.get("change_24h"))
+            labels = [str(x.get("signal") or x.get("trend") or x.get("bias") or "").lower() for x in snap.get("multi_timeframe_rows", []) if isinstance(x, dict)]
+            mixed = any(any(k in x for k in ("bull","buy","up")) for x in labels) and any(any(k in x for k in ("bear","sell","down")) for x in labels)
+            names = {
+                "confidence": self._bucket(confidence, [(50,60,"50–60"),(60,70,"60–70"),(70,80,"70–80"),(80,90,"80–90"),(90,float("inf"),"90+")]),
+                "risk_score": self._bucket(risk, [(0,26,"0–25"),(26,51,"26–50"),(51,76,"51–75"),(76,float("inf"),"76–100")]),
+                "atr": self._bucket(atr, [(0,1,"under 1%"),(1,2,"1–2%"),(2,4,"2–4%"),(4,float("inf"),"4%+")]),
+                "change_24h": self._bucket(abs(change) if change is not None else None, [(0,2,"under 2%"),(2,5,"2–5%"),(5,10,"5–10%"),(10,float("inf"),"10%+")]),
+                "timeframe_confirmation": "mixed" if mixed else "aligned" if labels else "unknown"}
+            for kind, name in names.items(): bucketed[kind].setdefault(name, []).append(review["realized_return_pct"])
+        for kind, values in bucketed.items():
+            bucketed[kind] = {name: {"trades": len(items), "average_return_pct": sum(items)/len(items),
+                                     "win_rate": sum(x > 0 for x in items)/len(items)*100} for name, items in values.items()}
+        best_market, worst_market = extremes("market"); best_symbol, worst_symbol = extremes("symbol")
+        best_side, worst_side = extremes("side")
+        close_reasons = grouped("close_reason"); traps = grouped("trap_category")
+        common = lambda values: max(values, key=lambda k: values[k]["trades"], default=None)
+        gross_wins = sum(max(0, x["realized_pnl"]) for x in reviews)
+        gross_losses = abs(sum(min(0, x["realized_pnl"]) for x in reviews))
+        recommendation = {"recommendation": "needs_more_samples", "reason": "Learning insights are early; keep reviewing paper trades.", "confidence": "low", "sample_size": len(reviews)}
+        if len(losses) >= 3:
+            trap = common(traps)
+            recommendation = {"recommendation": "tighten_filter", "reason": f"Loss reviews repeatedly identify {str(trap or 'uncertain setups').replace('_',' ')}.",
+                              "confidence": "medium" if len(reviews) >= 20 else "low", "sample_size": len(reviews)}
+        return {"total_closed_trades": len(self.trades()) if symbol is None else len(reviews), "reviewed_trades": len(reviews),
+                "win_rate": len(wins)/len(reviews)*100 if reviews else 0, "average_return_pct": sum(returns)/len(returns) if returns else 0,
+                "average_win_pct": sum(x["realized_return_pct"] for x in wins)/len(wins) if wins else 0,
+                "average_loss_pct": sum(x["realized_return_pct"] for x in losses)/len(losses) if losses else 0,
+                "profit_factor": gross_wins/gross_losses if gross_losses else (None if not gross_wins else "infinite"),
+                "best_market": best_market, "worst_market": worst_market, "best_symbol": best_symbol, "worst_symbol": worst_symbol,
+                "best_side": best_side, "worst_side": worst_side,
+                "average_holding_time_seconds": sum(x["holding_duration_seconds"] for x in reviews)/len(reviews) if reviews else 0,
+                "most_common_close_reason": common(close_reasons), "most_common_trap_category": common(traps),
+                "confidence_bucket_performance": bucketed["confidence"], "risk_score_bucket_performance": bucketed["risk_score"],
+                "atr_bucket_performance": bucketed["atr"], "change_24h_bucket_performance": bucketed["change_24h"],
+                "timeframe_confirmation_performance": bucketed["timeframe_confirmation"],
+                "small_sample_warning": "Learning insights are early. More paper trades are needed before making strong conclusions." if len(reviews) < 20 else None,
+                "learning_recommendation": recommendation}
 
     def trades(self) -> list[dict]:
         with self._database() as db:
