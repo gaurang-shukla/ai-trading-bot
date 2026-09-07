@@ -58,7 +58,7 @@ def test_quick_refresh_records_completion_time_separately_from_old_provider_time
     refreshed = datetime.fromisoformat(payload["setup_refreshed_at"])
     assert refreshed >= before
     assert payload["provider_data_timestamp"] == old_market_time
-    assert payload["stale_after_seconds"] == 90
+    assert payload["stale_after_seconds"] == 120
 
 
 def test_frontend_uses_setup_refresh_not_candle_time_and_uniform_deep_controls():
@@ -67,10 +67,33 @@ def test_frontend_uses_setup_refresh_not_candle_time_and_uniform_deep_controls()
     assert "Number(data.stale_after_seconds)" in javascript
     assert "Market data timestamp:" in javascript
     assert "Could not refresh latest market data. Showing last known setup." in javascript
-    assert "Quick Signal and Fast AI Explanation remain available." in javascript
+    assert "Use Quick Signal and Fast AI Explanation." in javascript
     assert "state.can_retry?'<button id=\"deep-button\"" in javascript
     assert "restart-deep" not in javascript
     running = javascript.split("function runningMarkup", 1)[1].split("function deepInsight", 1)[0]
     assert "Use Quick Signal" in running
     assert "Run Advanced Research" not in running
     assert "SIDE.HOLD" not in javascript
+
+
+def test_market_freshness_thresholds_are_explicit():
+    javascript = TestClient(app).get("/assets/app.js").text
+    assert "crypto_spot:120,crypto_futures:120" in javascript
+    assert "forex:600,commodities:600,equities:900,indian_indices:900" in javascript
+
+
+def test_expired_deep_job_is_a_calm_structured_state(monkeypatch):
+    monkeypatch.setenv("SIGNAL_DEBUG", "false")
+    payload = TestClient(app).get("/api/analyze/deep/status/expired-id").json()
+    assert payload["status"] == "expired_job"
+    assert payload["user_friendly_error"] == "Advanced Research session expired."
+    assert "debug_error" not in payload
+    javascript = TestClient(app).get("/assets/app.js").text
+    assert "sessionStorage.removeItem(`deep-job:${key}`)" in javascript
+    assert "Advanced Research session expired." in javascript
+
+
+def test_expired_deep_job_raw_detail_is_debug_only(monkeypatch):
+    monkeypatch.setenv("SIGNAL_DEBUG", "true")
+    payload = TestClient(app).get("/api/analyze/deep/status/expired-id").json()
+    assert payload["debug_error"] == "Deep AI job not found"

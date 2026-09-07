@@ -37,6 +37,7 @@ from .venues import default_registry
 
 
 WEB_DIR = Path(__file__).with_name("web")
+DEFAULT_LOCAL_OPENBB_URL = "http://127.0.0.1:6900"
 
 
 load_project_env()
@@ -186,6 +187,33 @@ def _deep_failure_from_notice(notice: str, attempted_symbol: str) -> DeepResearc
 
 def _debug_enabled() -> bool:
     return os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _openbb_provider_configured() -> bool:
+    """A library default is not evidence that a Bank Nifty provider was connected."""
+    configured = os.getenv("OPENBB_API_URL", "").strip().rstrip("/")
+    return bool(configured and configured != DEFAULT_LOCAL_OPENBB_URL)
+
+
+def _openbb_url_present() -> bool:
+    return bool(os.getenv("OPENBB_API_URL", "").strip())
+
+
+def _banknifty_flags(configured: bool, status: str) -> dict:
+    retry = configured and status == "temporarily_unavailable"
+    return {"provider_configured": configured, "provider_retry_available": retry,
+            "provider_action_label": "Check provider again" if retry else None}
+
+
+def _freshness_threshold(market: MarketKind) -> int:
+    return {
+        MarketKind.CRYPTO_SPOT: 120,
+        MarketKind.CRYPTO_FUTURES: 120,
+        MarketKind.FOREX: 600,
+        MarketKind.COMMODITIES: 600,
+        MarketKind.EQUITIES: 900,
+        MarketKind.INDIAN_INDICES: 900,
+    }.get(market, 900)
 
 
 def _provider_failure_category(*errors: Exception) -> str:
@@ -417,14 +445,16 @@ def create_app() -> FastAPI:
     def banknifty_options(expiry: str | None = None, option_type: str | None = None,
                           moneyness: str | None = None):
         """Return a genuine OpenBB/NSE chain or an explicit unavailable state."""
-        if not os.getenv("OPENBB_API_URL"):
+        provider_configured = _openbb_provider_configured()
+        if not _openbb_url_present():
             result = {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
                       "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
                       "research_only": True, "provider_attempts": {"openbb": False, "nse_fallback": False},
                       "failure_category": "not_configured", "provider_status": "not_configured",
                       "explanation": "This module is disabled until a reliable options provider is connected.",
                       "last_checked": datetime.now(timezone.utc).isoformat(),
-                      "setup_note": "Configure an option-chain capable OpenBB service to enable this module."}
+                      "setup_note": "Configure an option-chain capable OpenBB service to enable this module.",
+                      **_banknifty_flags(False, "not_configured")}
             if _debug_enabled():
                 result["provider_diagnostics"] = [empty_provider_diagnostic("openbb")]
             return result
@@ -476,9 +506,11 @@ def create_app() -> FastAPI:
                         "research_only": True, "provider_attempts": {"openbb": True, "nse_fallback": True},
                         "failure_category": category,
                         "explanation": "Provider attempts completed, but a valid option chain could not be retrieved.",
-                        "provider_status": category if category != "nse_empty_chain" else "nse_empty_chain",
+                        "provider_status": ("temporarily_unavailable" if provider_configured
+                                            else "not_configured"),
                         "last_checked": datetime.now(timezone.utc).isoformat(),
-                        "setup_note": "A reliable options data provider is required for production Bank Nifty option-chain coverage."}
+                        "setup_note": "A reliable options data provider is required for production Bank Nifty option-chain coverage.",
+                        **_banknifty_flags(provider_configured, "temporarily_unavailable")}
                 if _debug_enabled():
                     result["provider_diagnostics"] = [openbb_diag, nse_diag]
                 return result
@@ -486,6 +518,7 @@ def create_app() -> FastAPI:
         # Filters may legitimately select no contracts while the provider remains available.
         result["available"] = True
         result["provider_status"] = "connected"
+        result.update(_banknifty_flags(True, "connected"))
         if _debug_enabled():
             active = openbb_diag if result["source"] == "OpenBB" else nse.diagnostic
             result["provider_diagnostics"] = [openbb_diag] + ([] if active is openbb_diag else [active])
@@ -618,8 +651,7 @@ def create_app() -> FastAPI:
             if warnings:
                 result["warnings"] = warnings
             result["notice"] = "Deterministic quick signal only. No AI or live order was used."
-            result["stale_after_seconds"] = (90 if request.market in {
-                MarketKind.CRYPTO_SPOT, MarketKind.CRYPTO_FUTURES} else 600)
+            result["stale_after_seconds"] = _freshness_threshold(request.market)
             result["advanced_research_availability"] = advanced_research_availability(request, result)
             quick_results.put(request.market.value, symbol, result)
             return result
@@ -849,7 +881,11 @@ def create_app() -> FastAPI:
     def deep_status(job_id: str):
         job = deep_jobs.get(job_id)
         if job is None:
-            raise HTTPException(404, "Deep AI job not found")
+            result = {"status": "expired_job", "job_id": job_id,
+                      "user_friendly_error": "Advanced Research session expired."}
+            if _debug_enabled():
+                result["debug_error"] = "Deep AI job not found"
+            return result
         return job
 
     @app.post("/api/paperclip/analyze")
