@@ -192,3 +192,18 @@ def test_market_and_ranking_pages_include_one_shared_refresh_control():
     assert "Refreshing…" in script
     assert "Refresh available in ${remaining}s" in script
     assert "Couldn’t refresh right now. Showing last available data." in script
+
+
+def test_asset_refresh_controls_and_paper_confirmation_safety_copy():
+    script = client.get("/assets/app.js").text
+    assert "Refresh price &amp; signal" in script
+    assert "refresh:true" in script
+    assert "Refreshing..." in script
+    assert "button.disabled=true" in script
+    assert "Could not refresh latest market data. Showing last known setup." in script
+    assert "Last refreshed time:" in script
+    assert "Refresh recommended before opening this paper trade." in script
+    assert "Setup may be stale — refresh before paper trading." in script
+    assert "Entry price:" in script
+    assert "Amount invested:" in script
+    assert "Estimated quantity:" in script

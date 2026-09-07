@@ -24,7 +24,8 @@ def test_banknifty_options_route_exists():
     assert {"market": "banknifty_options", "venue": "openbb"} in client.get("/api/markets").json()
 
 
-def test_unavailable_provider_state_does_not_crash_or_return_fake_rows():
+def test_unavailable_provider_state_does_not_crash_or_return_fake_rows(monkeypatch):
+    monkeypatch.setenv("OPENBB_API_URL", "http://configured.test")
     with (patch("tradebot.app.OpenBBClient.option_chain", side_effect=RuntimeError("not supported")),
           patch("tradebot.app.NSEOptionChainClient.option_chain", side_effect=RuntimeError("blocked"))):
         response = client.get("/api/banknifty-options")
@@ -51,19 +52,40 @@ def test_banknifty_provider_errors_are_sanitized_in_debug(monkeypatch):
     assert "private nse detail" not in text
 
 
-def test_banknifty_ui_keeps_attempt_metadata_in_compact_details():
+def test_banknifty_provider_required_ui_has_safe_retry_and_diagnostics_states():
     javascript = client.get("/assets/app.js").text
     assert '<details class="provider-attempts"><summary>Provider diagnostics</summary>' in javascript
     assert "data.provider_diagnostics?" in javascript
-    assert "Live option-chain provider required" in javascript
-    assert "Connect live options provider" in javascript
-    assert "Import option-chain CSV for demo/research" in javascript
-    assert "retry-banknifty" in javascript
+    assert "Bank Nifty Options require a live option-chain provider" in javascript
+    assert "This module is disabled until a reliable options provider is connected." in javascript
+    assert "data.provider_status!=='not_configured'" in javascript
+    assert "Check provider again" in javascript
     assert "No fake rows shown" in javascript
     assert "No fake rows are generated." in javascript
+    assert "Research only." in javascript
 
 
-def test_openbb_empty_response_triggers_nse_fallback():
+def test_unconfigured_provider_is_not_called_and_hides_diagnostics(monkeypatch):
+    monkeypatch.delenv("OPENBB_API_URL", raising=False)
+    monkeypatch.setenv("SIGNAL_DEBUG", "false")
+    with patch("tradebot.app.OpenBBClient.option_chain") as provider:
+        payload = client.get("/api/banknifty-options").json()
+    provider.assert_not_called()
+    assert payload["provider_status"] == "not_configured"
+    assert payload["contracts"] == []
+    assert "provider_diagnostics" not in payload
+
+
+def test_provider_diagnostics_are_visible_only_in_debug(monkeypatch):
+    monkeypatch.delenv("OPENBB_API_URL", raising=False)
+    monkeypatch.setenv("SIGNAL_DEBUG", "true")
+    payload = client.get("/api/banknifty-options").json()
+    assert payload["provider_status"] == "not_configured"
+    assert payload["provider_diagnostics"]
+
+
+def test_openbb_empty_response_triggers_nse_fallback(monkeypatch):
+    monkeypatch.setenv("OPENBB_API_URL", "http://configured.test")
     nse = {"source": "NSE fallback", "underlying_price": 51020, "contracts": RAW["contracts"]}
     with (patch("tradebot.app.OpenBBClient.option_chain", return_value={"contracts": []}),
           patch("tradebot.app.NSEOptionChainClient.option_chain", return_value=nse) as fallback):
@@ -144,7 +166,8 @@ def test_indian_deep_ai_missing_ohlcv_has_clean_fallback():
     assert "debug_error" not in result
 
 
-def test_empty_provider_attempts_are_distinguished_without_fabricated_rows():
+def test_empty_provider_attempts_are_distinguished_without_fabricated_rows(monkeypatch):
+    monkeypatch.setenv("OPENBB_API_URL", "http://configured.test")
     with (patch("tradebot.app.OpenBBClient.option_chain", return_value={"contracts": []}),
           patch("tradebot.app.NSEOptionChainClient.option_chain", return_value={"contracts": [], "underlying_price": None})):
         payload = client.get("/api/banknifty-options").json()

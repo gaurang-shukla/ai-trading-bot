@@ -170,11 +170,11 @@ class CandleCache:
         self._lock = threading.Lock()
 
     def get_or_load(self, symbol: str, timeframe: str,
-                    loader: Callable[[], list[Candle]]) -> list[Candle]:
+                    loader: Callable[[], list[Candle]], refresh: bool = False) -> list[Candle]:
         key, now = (symbol.upper(), timeframe), time.monotonic()
         with self._lock:
             entry = self._values.get(key)
-            if entry and now - entry[0] < self.ttl_seconds:
+            if not refresh and entry and now - entry[0] < self.ttl_seconds:
                 return entry[1]
         value = loader()
         if value:
