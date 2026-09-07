@@ -37,7 +37,9 @@ def test_unavailable_provider_state_does_not_crash_or_return_fake_rows(monkeypat
     assert response.json()["available"] is False
     assert response.json()["provider_attempts"] == {"openbb": True, "nse_fallback": True}
     assert response.json()["failure_category"] == "nse_http_error"
-    assert response.json()["provider_status"] == "nse_http_error"
+    assert response.json()["provider_status"] == "temporarily_unavailable"
+    assert response.json()["provider_configured"] is True
+    assert response.json()["provider_retry_available"] is True
     assert "provider_errors" not in response.json()
 
 
@@ -58,8 +60,9 @@ def test_banknifty_provider_required_ui_has_safe_retry_and_diagnostics_states():
     assert "data.provider_diagnostics?" in javascript
     assert "Bank Nifty Options require a live option-chain provider" in javascript
     assert "This module is disabled until a reliable options provider is connected." in javascript
-    assert "data.provider_status!=='not_configured'" in javascript
-    assert "Check provider again" in javascript
+    assert "data.provider_retry_available===true" in javascript
+    assert "data.provider_configured===true" in javascript
+    assert "data.provider_action_label" in javascript
     assert "No fake rows shown" in javascript
     assert "No fake rows are generated." in javascript
     assert "Research only." in javascript
@@ -72,8 +75,32 @@ def test_unconfigured_provider_is_not_called_and_hides_diagnostics(monkeypatch):
         payload = client.get("/api/banknifty-options").json()
     provider.assert_not_called()
     assert payload["provider_status"] == "not_configured"
+    assert payload["provider_configured"] is False
+    assert payload["provider_retry_available"] is False
     assert payload["contracts"] == []
     assert "provider_diagnostics" not in payload
+
+
+def test_default_local_openbb_placeholder_is_not_a_configured_provider(monkeypatch):
+    monkeypatch.setenv("OPENBB_API_URL", "http://127.0.0.1:6900")
+    with (patch("tradebot.app.OpenBBClient.option_chain", side_effect=ConnectionRefusedError()),
+          patch("tradebot.app.NSEOptionChainClient.option_chain", side_effect=RuntimeError("down"))):
+        payload = client.get("/api/banknifty-options").json()
+    assert payload["provider_status"] == "not_configured"
+    assert payload["provider_configured"] is False
+    assert payload["provider_retry_available"] is False
+    assert payload["contracts"] == []
+
+
+def test_reachable_local_placeholder_must_return_valid_chain_before_use(monkeypatch):
+    monkeypatch.setenv("OPENBB_API_URL", "http://127.0.0.1:6900")
+    with (patch("tradebot.app.OpenBBClient.option_chain", return_value=RAW),
+          patch("tradebot.app.OpenBBClient.snapshot",
+                return_value=MarketSnapshot("^NSEBANK", 51020, "now", "openbb"))):
+        payload = client.get("/api/banknifty-options").json()
+    assert payload["available"] is True
+    assert payload["provider_status"] == "connected"
+    assert payload["contracts"]
 
 
 def test_provider_diagnostics_are_visible_only_in_debug(monkeypatch):
