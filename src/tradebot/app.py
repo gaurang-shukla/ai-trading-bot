@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient
+from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient, research_symbol
 from .analysis import (CandleCache, DeepJobRegistry, FastAIExplainer, QuickResultCache,
                        QuickSignalEngine, TIMEFRAMES, deterministic_fast_explanation,
                        normalize_deep_reasoning)
@@ -46,6 +46,108 @@ deep_jobs = DeepJobRegistry()
 candle_cache = CandleCache()
 quick_results = QuickResultCache()
 fast_ai = FastAIExplainer()
+
+
+class DeepResearchUnavailable(RuntimeError):
+    """Expected, user-safe preflight/provider failure for an optional deep run."""
+
+    def __init__(self, message: str, category: str, **details):
+        super().__init__(message)
+        self.deep_failure = {"status": ("skipped" if category in {
+            "stale_external_data", "unsupported_symbol"} else "failed"), "failure_category": category,
+                             "user_friendly_error": message, **details}
+
+
+def _clean_side(value) -> str:
+    """Normalize enum/string representations such as ``Side.HOLD`` for the API."""
+    text = str(getattr(value, "value", value) or "HOLD").upper()
+    return text.removeprefix("SIDE.")
+
+
+def _deep_preflight(request: "AnalyzeRequest", quick: dict) -> dict:
+    """Describe and validate the market-data route before TradingAgents is called.
+
+    TradingAgents currently owns its external research feed and cannot consume the
+    candles fetched by the app.  Crypto pairs are therefore allowed only when their
+    mapped USD instrument is known to be covered; exchange-only coins are skipped
+    rather than silently substituted with an old Yahoo listing.
+    """
+    original = request.symbol.upper()
+    attempted = research_symbol(original)
+    candles = quick.get("chart_timeframes") or {}
+    latest = None
+    for rows in candles.values():
+        for row in rows or []:
+            value = row.get("timestamp")
+            if value is not None and (latest is None or str(value) > str(latest)):
+                latest = value
+    candle_age = None
+    if latest is not None:
+        try:
+            numeric = float(latest)
+            candle_time = (datetime.fromtimestamp(numeric / 1000 if numeric > 10_000_000_000 else numeric,
+                                                  timezone.utc) if str(latest).replace(".", "", 1).isdigit()
+                           else datetime.fromisoformat(str(latest).replace("Z", "+00:00")))
+            candle_age = max(0, (datetime.now(timezone.utc) - candle_time).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    info = {"market": request.market.value, "original_symbol": original,
+            "provider_symbol": attempted, "attempted_symbol": attempted,
+            "display_name": quick.get("display_name") or original,
+            "live_app_provider_source": quick.get("source"),
+            "snapshot_timestamp": quick.get("last_updated"),
+            "latest_candle_timestamp": latest, "candle_age_seconds": candle_age,
+            "external_symbol_supported": True, "external_data_fresh": None,
+            "research_data_path": "mapped_external_symbol", "source_used": "TradingAgents external provider"}
+    if request.market not in {MarketKind.CRYPTO_SPOT, MarketKind.CRYPTO_FUTURES}:
+        return info
+    # Explicitly conservative until TradingAgents supports injected WEEX OHLCV.
+    defaults = "BTC,ETH,SOL,LINK,XRP,DOGE,ADA,BNB,AVAX,DOT,LTC,BCH"
+    supported = {item.strip().upper() for item in
+                 os.getenv("TRADINGAGENTS_SUPPORTED_CRYPTO", defaults).split(",") if item.strip()}
+    base = original.replace("/", "").split(":", 1)[0]
+    for quote_currency in ("USDT", "USDC", "USD"):
+        if base.endswith(quote_currency):
+            base = base[:-len(quote_currency)]
+            break
+    if base not in supported:
+        info["external_symbol_supported"] = False
+        pair = original[:-4] + "/USDT" if original.endswith("USDT") else original
+        raise DeepResearchUnavailable(
+            f"Advanced Research is unavailable for {pair} because its external research symbol "
+            f"({attempted}) is not supported with verified fresh data. Quick Signal is using live "
+            "WEEX data and remains available.", "unsupported_symbol", can_retry=False,
+            retry_recommended=False, source_used=info["source_used"], attempted_symbol=attempted)
+    return info
+
+
+def _deep_failure_from_notice(notice: str, attempted_symbol: str) -> DeepResearchUnavailable:
+    lower = notice.lower()
+    stale = "stale" in lower or "latest row" in lower
+    category = "stale_external_data" if stale else (
+        "unsupported_symbol" if "no market data" in lower or "unsupported" in lower else
+        "insufficient_candles" if "ohlcv" in lower or "candle" in lower else "provider_unavailable")
+    if any(word in lower for word in ("openai", "api key", "llm")) and "timeout" in lower:
+        category = "openai_timeout"
+    elif "timeout" in lower or "timed out" in lower:
+        category = "tradingagents_timeout"
+    elif any(word in lower for word in ("api key", "not configured", "connection", "unavailable")):
+        category = "provider_unavailable"
+    elif category == "provider_unavailable" and lower.startswith("ai failed:"):
+        category = "tradingagents_error"
+    stale_date = None
+    if stale:
+        import re
+        match = re.search(r"latest row is (\d{4}-\d{2}-\d{2})", notice, re.I)
+        stale_date = match.group(1) if match else None
+    message = (f"Advanced Research is unavailable because the external research provider returned stale data for "
+               f"{attempted_symbol}. Quick Signal remains available." if stale else
+               "Advanced Research is unavailable for this symbol right now. Quick Signal remains available.")
+    can_retry = category not in {"stale_external_data", "unsupported_symbol", "insufficient_candles"}
+    return DeepResearchUnavailable(message, category, can_retry=can_retry,
+        retry_recommended=can_retry and category in {"openai_timeout", "tradingagents_timeout", "provider_unavailable"},
+        source_used="TradingAgents external provider", attempted_symbol=attempted_symbol,
+        stale_data_date=stale_date)
 
 
 def _debug_enabled() -> bool:
@@ -517,10 +619,18 @@ def create_app() -> FastAPI:
                      or quick_analyze(request))
             quick_context["result"] = quick
             progress(2, "Checking technical indicators")
+            preflight = _deep_preflight(request, quick)
             progress(3, "Running TradingAgents research")
             deep = run_deep_analysis(request, quick)
             if deep.get("ai_available") is False:
-                raise RuntimeError(deep.get("ai_notice") or "Deep AI is unavailable")
+                raise _deep_failure_from_notice(
+                    deep.get("ai_notice") or "Deep AI is unavailable",
+                    preflight["attempted_symbol"])
+            signal = deep.get("signal") or {}
+            signal["side"] = _clean_side(signal.get("side"))
+            if signal.get("model") == "safe_fallback" or str(signal.get("rationale", "")).startswith("AI failed:"):
+                raise _deep_failure_from_notice(str(signal.get("rationale") or "TradingAgents failed"),
+                                                preflight["attempted_symbol"])
             progress(4, "Building plain-language summary")
             merged = {**quick, **deep, "quick_signal": quick}
             for key in ("live_price", "change_24h", "volume", "source", "last_updated",
@@ -531,7 +641,9 @@ def create_app() -> FastAPI:
             progress(5, "Finalizing decision")
             result = normalize_deep_reasoning(merged, quick)
             result.update({"mode": "deep", "cached": False,
-                           "deep_analyzed_at": datetime.now(timezone.utc).isoformat()})
+                           "deep_analyzed_at": datetime.now(timezone.utc).isoformat(),
+                           "research_preflight": preflight, "source_used": preflight["source_used"],
+                           "attempted_symbol": preflight["attempted_symbol"]})
             return result
 
         def fallback():
