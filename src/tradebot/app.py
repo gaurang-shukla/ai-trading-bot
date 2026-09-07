@@ -194,6 +194,7 @@ class AnalyzeRequest(BaseModel):
     venue: str = Field(default="weex", min_length=1, max_length=32)
     as_of: str = Field(default_factory=lambda: date.today().isoformat())
     equity: float = Field(default=100_000, gt=0, le=100_000_000)
+    refresh: bool = False
 
 
 class DeepAnalyzeRequest(AnalyzeRequest):
@@ -382,6 +383,17 @@ def create_app() -> FastAPI:
     def banknifty_options(expiry: str | None = None, option_type: str | None = None,
                           moneyness: str | None = None):
         """Return a genuine OpenBB/NSE chain or an explicit unavailable state."""
+        if not os.getenv("OPENBB_API_URL"):
+            result = {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
+                      "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
+                      "research_only": True, "provider_attempts": {"openbb": False, "nse_fallback": False},
+                      "failure_category": "not_configured", "provider_status": "not_configured",
+                      "explanation": "This module is disabled until a reliable options provider is connected.",
+                      "last_checked": datetime.now(timezone.utc).isoformat(),
+                      "setup_note": "Configure an option-chain capable OpenBB service to enable this module."}
+            if _debug_enabled():
+                result["provider_diagnostics"] = [empty_provider_diagnostic("openbb")]
+            return result
         openbb_diag = empty_provider_diagnostic("openbb")
         openbb_diag["attempted"] = True
         provider = OpenBBClient(asset_class="index")
@@ -527,7 +539,7 @@ def create_app() -> FastAPI:
                           if request.market is MarketKind.INDIAN_INDICES else TIMEFRAMES)
             executor = ThreadPoolExecutor(max_workers=len(timeframes), thread_name_prefix="quick-candles")
             futures = {executor.submit(candle_cache.get_or_load, f"{request.market.value}:{symbol}", frame,
-                       lambda f=frame: provider.candles(symbol, f, 250)): frame
+                       lambda f=frame: provider.candles(symbol, f, 250), request.refresh): frame
                        for frame in timeframes}
             candle_timeout = max(.05, float(os.getenv("SIGNAL_QUICK_CANDLE_TIMEOUT_SECONDS", "8")))
             try:

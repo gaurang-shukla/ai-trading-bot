@@ -379,6 +379,36 @@ def test_quick_api_reuses_ohlcv_for_chart_without_extra_fetch():
     assert provider.candles.call_count == 6
 
 
+def test_quick_refresh_fetches_price_and_candles_and_recalculates_setup():
+    provider = Mock()
+    first = snapshot()
+    second = MarketSnapshot(first.symbol, first.price + 25, "2026-09-07T00:01:00Z",
+                            first.source, change_24h=8, volume=first.volume)
+    provider.snapshot.side_effect = [first, second]
+    generation = {"value": 0}
+
+    def candles(_symbol, _frame, _limit):
+        generation["value"] += 1
+        offset = 0 if generation["value"] <= 6 else 25
+        return [Candle(i, 100 + i + offset, 102 + i + offset, 99 + i + offset,
+                       101 + i + offset, 1_000 + i) for i in range(30)]
+
+    provider.candles.side_effect = candles
+    registry = Mock()
+    registry.market_data.return_value = provider
+    request = {"symbol": "REFRESHSETUPUSDT", "refresh": False}
+    with patch("tradebot.app.default_registry", return_value=registry):
+        initial = TestClient(app).post("/api/analyze/quick", json=request).json()
+        request["refresh"] = True
+        refreshed = TestClient(app).post("/api/analyze/quick", json=request).json()
+    assert provider.snapshot.call_count == 2
+    assert provider.candles.call_count == 12
+    assert refreshed["live_price"] != initial["live_price"]
+    assert refreshed["chart_timeframes"] != initial["chart_timeframes"]
+    assert refreshed["last_updated"] == "2026-09-07T00:01:00Z"
+    assert refreshed["risk_plan"] != initial["risk_plan"]
+
+
 def test_empty_candles_keep_live_price_card_and_chart_unavailable():
     javascript = TestClient(app).get("/assets/app.js").text
     assert 'class="live-price"' in javascript
