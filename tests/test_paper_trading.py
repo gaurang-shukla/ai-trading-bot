@@ -123,6 +123,42 @@ def test_hold_requires_force_and_buy_opens_long(tmp_path: Path, monkeypatch):
     assert response.json()["side"] == "LONG"
 
 
+@pytest.mark.parametrize(("market", "symbol"), [
+    ("crypto_futures", "DOTUSDT"),
+    ("crypto_spot", "AVAXUSDT"),
+    ("indian_indices", "HDFCBANK.NS"),
+    ("equities", "AAPL"),
+    ("forex", "EURUSD"),
+    ("commodities", "GC"),
+])
+def test_active_quick_signal_opens_across_asset_classes(market, symbol, tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGNAL_DB_PATH", str(tmp_path / f"{market}.db"))
+    quick_results.put(market, symbol, {
+        "live_price": 100, "display_name": symbol, "signal": {"side": "BUY", "confidence": .79},
+        "risk_plan": {"stop_loss": 95, "take_profit": 110},
+    })
+    response = TestClient(create_app()).post("/api/paper/positions", json={
+        "market": market, "symbol": symbol, "notional_amount": 500,
+    })
+    assert response.status_code == 201, response.text
+    assert response.json()["symbol"] == symbol
+
+
+@pytest.mark.parametrize("signal", [
+    {"signal": {"side": "BUY", "confidence": .79}},
+    {"signal": "BUY", "confidence": .79},
+    {"side": "BUY", "confidence": .79},
+])
+def test_paper_store_accepts_quick_and_legacy_signal_shapes(signal, tmp_path):
+    store = PaperStore(tmp_path / f"shape-{len(str(signal))}.db")
+    position = store.open_position(
+        market="equities", symbol="SHAPE", display_name="Shape", side="LONG",
+        price=100, notional=500, signal=signal, risk_plan=None,
+    )
+    assert position["source_signal_action"] == "BUY"
+    assert position["signal_snapshot"]["risk_plan"] == {}
+
+
 def test_paper_frontend_requests_use_valid_fetch_init_objects():
     javascript = Path("src/tradebot/web/app.js").read_text()
 
