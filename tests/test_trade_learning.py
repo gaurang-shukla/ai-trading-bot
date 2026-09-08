@@ -80,6 +80,16 @@ def test_learning_analytics_and_api(tmp_path, monkeypatch):
     assert client.post(f"/api/paper/reviews/{loss['id']}/regenerate").status_code == 200
 
 
+def test_learning_endpoints_have_stable_empty_responses(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGNAL_DB_PATH", str(tmp_path / "empty-api.db"))
+    client = TestClient(create_app())
+    assert client.get("/api/paper/reviews").json() == []
+    empty = client.get("/api/paper/learning").json()
+    filtered = client.get("/api/paper/learning?symbol=DOTUSDT").json()
+    assert empty["reviewed_trades"] == filtered["reviewed_trades"] == 0
+    assert empty["confidence_bucket_performance"] == {}
+
+
 def test_old_trade_without_snapshot_fields_does_not_crash(tmp_path):
     store = PaperStore(tmp_path / "old.db")
     position = store.open_position(market="equities", symbol="OLD", display_name="Old", side="LONG",
@@ -92,3 +102,7 @@ def test_learning_ui_sections_are_present():
     source = Path("src/tradebot/web/app.js").read_text()
     assert "Trade Reviews" in source and "Learning Analytics" in source
     assert "Past paper performance for this asset" in source and "Learning note" in source
+    assert "Learning data is not available yet." in source
+    assert "No paper reviews yet." in source
+    assert "querySelectorAll('.paper-inline-error')" in source
+    assert "getJSON('/api/paper/reviews').catch(()=>[])" in source

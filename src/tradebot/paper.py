@@ -238,7 +238,8 @@ class PaperStore:
                 "closed_trades_count": count, "mode": "paper"}
 
     def open_position(self, *, market: str, symbol: str, display_name: str, side: str,
-                      price: float, notional: float, signal: dict, risk_plan: dict) -> dict:
+                      price: float, notional: float, signal: dict | str,
+                      risk_plan: dict | None = None) -> dict:
         if side not in {"LONG", "SHORT"}:
             raise ValueError("Side must be LONG or SHORT")
         price = _positive_number(price, "Live price")
@@ -248,17 +249,25 @@ class PaperStore:
             raise ValueError("Calculated quantity is invalid")
         # Callers may provide the complete Quick Signal result.  Keep the legacy
         # signal-only contract working while producing one stable canonical snapshot.
-        quick = signal if isinstance(signal.get("signal"), dict) else {"signal": signal, "risk_plan": risk_plan}
-        source_signal = quick.get("signal") or signal
-        plan = quick.get("risk_plan") or risk_plan
-        levels = quick.get("key_levels") or {}
+        supplied = signal if isinstance(signal, dict) else {}
+        is_quick = isinstance(supplied.get("signal"), (dict, str))
+        quick = supplied if is_quick else {"signal": signal, "risk_plan": risk_plan}
+        raw_signal = quick.get("signal")
+        source_signal = raw_signal if isinstance(raw_signal, dict) else (
+            {"side": raw_signal} if isinstance(raw_signal, str) else supplied
+        )
+        plan = quick.get("risk_plan") if isinstance(quick.get("risk_plan"), dict) else risk_plan
+        plan = plan if isinstance(plan, dict) else {}
+        levels = quick.get("key_levels") if isinstance(quick.get("key_levels"), dict) else {}
+        volatility = quick.get("volatility_summary") if isinstance(quick.get("volatility_summary"), dict) else {}
+        momentum = quick.get("momentum_summary") if isinstance(quick.get("momentum_summary"), dict) else {}
         snapshot = _safe_snapshot({
             "market": market, "symbol": symbol.upper(), "display_name": display_name,
             "side": side, "source": "Quick Signal", "signal": source_signal,
             "advanced_research_decision": quick.get("advanced_research_decision") or quick.get("deep_research"),
             "entry_price": price, "stop_loss": plan.get("stop_loss"),
             "take_profit": plan.get("take_profit"), "risk_score": plan.get("risk_score"),
-            "confidence": source_signal.get("confidence"),
+            "confidence": source_signal.get("confidence", quick.get("confidence")),
             "opportunity_score": quick.get("opportunity_score"),
             "position_size_pct": plan.get("position_size_pct"), "amount_invested": notional,
             "estimated_quantity": quantity, "setup_refreshed_at": quick.get("setup_refreshed_at") or quick.get("last_updated"),
@@ -267,20 +276,20 @@ class PaperStore:
             "multi_timeframe_rows": quick.get("timeframe_breakdown") or [],
             "support_level": levels.get("support") or quick.get("support_level"),
             "resistance_level": levels.get("resistance") or quick.get("resistance_level"),
-            "atr_pct": quick.get("atr_pct") or (quick.get("volatility_summary") or {}).get("atr_pct"),
-            "rsi_summary": quick.get("rsi_summary") or (quick.get("momentum_summary") or {}).get("rsi"),
-            "macd_summary": quick.get("macd_summary") or (quick.get("momentum_summary") or {}).get("macd"),
+            "atr_pct": quick.get("atr_pct") or volatility.get("atr_pct"),
+            "rsi_summary": quick.get("rsi_summary") or momentum.get("rsi"),
+            "macd_summary": quick.get("macd_summary") or momentum.get("macd"),
             "ema_bias_summary": quick.get("ema_bias_summary") or quick.get("trend_summary"),
             "volume": quick.get("volume"), "change_24h": quick.get("change_24h"),
-            "funding_rate": quick.get("funding_rate"), "volatility": quick.get("volatility") or quick.get("volatility_summary"),
-            "reason": source_signal.get("rationale") or quick.get("plain_language_reason") or quick.get("reason"),
+            "funding_rate": quick.get("funding_rate"), "volatility": quick.get("volatility") or volatility or None,
+            "reason": source_signal.get("rationale") or quick.get("reasoning") or quick.get("plain_language_reason") or quick.get("reason"),
             "risk_plan": plan,
         })
         item = {"id": uuid.uuid4().hex, "market": market, "symbol": symbol.upper(),
                 "display_name": display_name, "side": side, "entry_price": price,
                 "current_price": price, "quantity": quantity, "notional_value": notional,
                 "stop_loss": plan.get("stop_loss"), "take_profit": plan.get("take_profit"),
-                "risk_score": plan.get("risk_score"), "confidence": source_signal.get("confidence"),
+                "risk_score": plan.get("risk_score"), "confidence": source_signal.get("confidence", quick.get("confidence")),
                 "position_size_pct": plan.get("position_size_pct"), "opened_at": _now(),
                 "source_signal_action": str(source_signal.get("side", "HOLD")), "status": "open",
                 "signal_snapshot": snapshot, "max_price": price, "min_price": price}
@@ -349,6 +358,8 @@ class PaperStore:
         try:
             snapshot = json.loads(trade.get("signal_snapshot") or "{}") if isinstance(trade.get("signal_snapshot"), str) else (trade.get("signal_snapshot") or {})
         except (TypeError, json.JSONDecodeError):
+            snapshot = {}
+        if not isinstance(snapshot, dict):
             snapshot = {}
         pnl = float(trade["realized_pnl"])
         result = "win" if pnl > 1e-9 else "loss" if pnl < -1e-9 else "breakeven"
@@ -437,7 +448,16 @@ class PaperStore:
         if clauses: query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY generated_at DESC"
         with self._database() as db:
-            return [json.loads(row[0]) for row in db.execute(query, params)]
+            rows = db.execute(query, params).fetchall()
+        result = []
+        for row in rows:
+            try:
+                review = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(review, dict):
+                result.append(review)
+        return result
 
     def regenerate_review(self, trade_id: str) -> dict:
         with self._lock, self._database() as db:
@@ -456,9 +476,12 @@ class PaperStore:
 
     def learning(self, symbol: str | None = None) -> dict:
         reviews = self.reviews(symbol=symbol)
-        returns = [float(x["realized_return_pct"]) for x in reviews]
-        wins = [x for x in reviews if x["result"] == "win"]
-        losses = [x for x in reviews if x["result"] == "loss"]
+        for review in reviews:
+            review["realized_return_pct"] = self._number(review.get("realized_return_pct")) or 0.0
+            review["realized_pnl"] = self._number(review.get("realized_pnl")) or 0.0
+        returns = [x["realized_return_pct"] for x in reviews]
+        wins = [x for x in reviews if x.get("result") == "win"]
+        losses = [x for x in reviews if x.get("result") == "loss"]
         def grouped(key):
             groups = {}
             for review in reviews:
@@ -473,11 +496,14 @@ class PaperStore:
         bucketed = {"confidence": {}, "risk_score": {}, "atr": {}, "change_24h": {}, "timeframe_confirmation": {}}
         for review in reviews:
             snap = review.get("signal_snapshot") or {}
+            if not isinstance(snap, dict): snap = {}
             confidence = self._number(snap.get("confidence")); risk = self._number(snap.get("risk_score"))
             if confidence is not None and confidence <= 1: confidence *= 100
             if risk is not None and risk <= 1: risk *= 100
             atr = self._number(snap.get("atr_pct")); change = self._number(snap.get("change_24h"))
-            labels = [str(x.get("signal") or x.get("trend") or x.get("bias") or "").lower() for x in snap.get("multi_timeframe_rows", []) if isinstance(x, dict)]
+            rows = snap.get("multi_timeframe_rows") or []
+            if not isinstance(rows, list): rows = []
+            labels = [str(x.get("signal") or x.get("trend") or x.get("bias") or "").lower() for x in rows if isinstance(x, dict)]
             mixed = any(any(k in x for k in ("bull","buy","up")) for x in labels) and any(any(k in x for k in ("bear","sell","down")) for x in labels)
             names = {
                 "confidence": self._bucket(confidence, [(50,60,"50–60"),(60,70,"60–70"),(70,80,"70–80"),(80,90,"80–90"),(90,float("inf"),"90+")]),
@@ -507,7 +533,7 @@ class PaperStore:
                 "profit_factor": gross_wins/gross_losses if gross_losses else (None if not gross_wins else "infinite"),
                 "best_market": best_market, "worst_market": worst_market, "best_symbol": best_symbol, "worst_symbol": worst_symbol,
                 "best_side": best_side, "worst_side": worst_side,
-                "average_holding_time_seconds": sum(x["holding_duration_seconds"] for x in reviews)/len(reviews) if reviews else 0,
+                "average_holding_time_seconds": sum(self._number(x.get("holding_duration_seconds")) or 0 for x in reviews)/len(reviews) if reviews else 0,
                 "most_common_close_reason": common(close_reasons), "most_common_trap_category": common(traps),
                 "confidence_bucket_performance": bucketed["confidence"], "risk_score_bucket_performance": bucketed["risk_score"],
                 "atr_bucket_performance": bucketed["atr"], "change_24h_bucket_performance": bucketed["change_24h"],

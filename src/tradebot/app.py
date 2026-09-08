@@ -804,7 +804,8 @@ def create_app() -> FastAPI:
         analyze_request = AnalyzeRequest(symbol=request.symbol, market=request.market,
                                          venue="weex" if request.market.value.startswith("crypto_") else "openbb")
         quick = quick_results.get(request.market.value, request.symbol) or quick_analyze(analyze_request)
-        raw_action = quick["signal"].get("side", "HOLD")
+        raw_signal = quick.get("signal", "HOLD")
+        raw_action = raw_signal.get("side", "HOLD") if isinstance(raw_signal, dict) else raw_signal
         action = str(getattr(raw_action, "value", raw_action)).upper()
         inactive_actions = {"HOLD", "WATCH", "AVOID"}
         if action in inactive_actions and not request.force:
