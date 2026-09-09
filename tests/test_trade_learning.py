@@ -72,6 +72,9 @@ def test_learning_analytics_and_api(tmp_path, monkeypatch):
     assert learning["reviewed_trades"] == 2 and learning["win_rate"] == 50
     assert learning["average_return_pct"] == 5
     assert learning["profit_factor"] == 2
+    assert learning["small_sample"] is True
+    assert learning["best_market"] == "equities"
+    assert learning["worst_market"] == "insufficient market variety"
     assert "80–90" in learning["confidence_bucket_performance"]
     assert "26–50" in learning["risk_score_bucket_performance"]
     assert learning["small_sample_warning"]
@@ -106,3 +109,17 @@ def test_learning_ui_sections_are_present():
     assert "No paper reviews yet." in source
     assert "querySelectorAll('.paper-inline-error')" in source
     assert "getJSON('/api/paper/reviews').catch(()=>[])" in source
+    assert "function formatProfitFactor(value)" in source
+    assert "numeric.toFixed(2)" in source
+    assert "Review at least 5 trades before drawing conclusions." in source
+    assert "overflow-wrap:anywhere" in Path("src/tradebot/web/styles.css").read_text()
+
+
+def test_five_reviews_leave_small_sample_state(tmp_path):
+    store = PaperStore(tmp_path / "enough-reviews.db")
+    for index in range(5):
+        position = setup(store, symbol=f"SAMPLE-{index}")
+        store.close_position(position["id"], 101 + index, "manual")
+    learning = store.learning()
+    assert learning["reviewed_trades"] == 5
+    assert learning["small_sample"] is False
