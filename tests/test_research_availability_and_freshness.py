@@ -33,11 +33,20 @@ def test_temporary_provider_failure_is_retryable():
     assert failure["can_retry"] is True
 
 
-def test_gold_and_banknifty_index_have_specific_preflight_states():
-    gold = availability(MarketKind.COMMODITIES, "GC")
-    assert gold["failure_category"] == "unsupported_market"
-    assert "commodity symbol" in gold["availability_reason"]
-    assert "TradingAgents" in gold["availability_reason"]
+def test_gold_and_oil_have_consistent_unsupported_research_states():
+    for symbol in ("GC", "CL"):
+        commodity = availability(MarketKind.COMMODITIES, symbol)
+        assert commodity["failure_category"] == "unsupported_market"
+        assert commodity["advanced_research_available"] is False
+        assert commodity["can_retry"] is False
+        assert commodity["recommended_action"] == "Use Quick Signal and Fast AI Explanation"
+        assert commodity["availability_reason"] == (
+            "Advanced Research is not yet available for commodities. "
+            "TradingAgents does not currently support this market."
+        )
+
+
+def test_banknifty_index_has_specific_preflight_state():
     bank = availability(MarketKind.INDIAN_INDICES, "BANKNIFTY")
     assert bank["availability_status"] == "unsupported_symbol"
     assert bank["recommended_action"] == "Use Quick Signal and Fast AI Explanation"
@@ -114,6 +123,7 @@ def test_frontend_uses_setup_refresh_not_candle_time_and_uniform_deep_controls()
     assert "Could not refresh latest market data. Showing last known setup." in javascript
     assert "Use Quick Signal and Fast AI Explanation." in javascript
     assert "state.can_retry?'<button id=\"deep-button\"" in javascript
+    assert "Advanced Research not yet available for commodities" in javascript
     assert "restart-deep" not in javascript
     running = javascript.split("function runningMarkup", 1)[1].split("function deepInsight", 1)[0]
     assert "Use Quick Signal" in running

@@ -99,7 +99,8 @@ def advanced_research_availability(request: "AnalyzeRequest", quick: dict) -> di
         )
     if request.market is MarketKind.COMMODITIES:
         return unavailable("unsupported_market",
-                           "Advanced Research is not available for this commodity symbol yet. TradingAgents does not support this market.")
+                           "Advanced Research is not yet available for commodities. "
+                           "TradingAgents does not currently support this market.")
     if request.market is MarketKind.FOREX:
         return unavailable("unsupported_market",
                            "Advanced Research is not available for this forex symbol yet. TradingAgents does not support this market.")

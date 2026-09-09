@@ -516,6 +516,10 @@ class PaperStore:
             bucketed[kind] = {name: {"trades": len(items), "average_return_pct": sum(items)/len(items),
                                      "win_rate": sum(x > 0 for x in items)/len(items)*100} for name, items in values.items()}
         best_market, worst_market = extremes("market"); best_symbol, worst_symbol = extremes("symbol")
+        # A single market cannot honestly be both the best and worst performer.
+        # Keep the useful label while making the missing comparison explicit.
+        if best_market is not None and best_market == worst_market:
+            worst_market = "insufficient market variety"
         best_side, worst_side = extremes("side")
         close_reasons = grouped("close_reason"); traps = grouped("trap_category")
         common = lambda values: max(values, key=lambda k: values[k]["trades"], default=None)
@@ -527,6 +531,7 @@ class PaperStore:
             recommendation = {"recommendation": "tighten_filter", "reason": f"Loss reviews repeatedly identify {str(trap or 'uncertain setups').replace('_',' ')}.",
                               "confidence": "medium" if len(reviews) >= 20 else "low", "sample_size": len(reviews)}
         return {"total_closed_trades": len(self.trades()) if symbol is None else len(reviews), "reviewed_trades": len(reviews),
+                "small_sample": len(reviews) < 5,
                 "win_rate": len(wins)/len(reviews)*100 if reviews else 0, "average_return_pct": sum(returns)/len(returns) if returns else 0,
                 "average_win_pct": sum(x["realized_return_pct"] for x in wins)/len(wins) if wins else 0,
                 "average_loss_pct": sum(x["realized_return_pct"] for x in losses)/len(losses) if losses else 0,
