@@ -199,9 +199,8 @@ def _debug_enabled() -> bool:
 
 
 def _openbb_provider_configured() -> bool:
-    """A library default is not evidence that a Bank Nifty provider was connected."""
-    configured = os.getenv("OPENBB_API_URL", "").strip().rstrip("/")
-    return bool(configured and configured != DEFAULT_LOCAL_OPENBB_URL)
+    """Return whether the operator supplied an OpenBB endpoint to try first."""
+    return bool(os.getenv("OPENBB_API_URL", "").strip())
 
 
 def _openbb_url_present() -> bool:
@@ -209,7 +208,9 @@ def _openbb_url_present() -> bool:
 
 
 def _banknifty_flags(configured: bool, status: str) -> dict:
-    retry = configured and status == "temporarily_unavailable"
+    # The built-in NSE client is always a genuine provider candidate, even when
+    # an optional OpenBB service has not been configured.
+    retry = status == "temporarily_unavailable"
     return {"provider_configured": configured, "provider_retry_available": retry,
             "provider_action_label": "Check provider again" if retry else None}
 
@@ -289,6 +290,10 @@ class OpenPaperPositionRequest(BaseModel):
 
 class ClosePaperPositionRequest(BaseModel):
     close_reason: str = Field(default="Closed by user", max_length=200)
+
+
+class CloseAllPaperPositionsRequest(BaseModel):
+    confirm: bool = False
 
 
 class WatchlistRequest(BaseModel):
@@ -455,46 +460,32 @@ def create_app() -> FastAPI:
                           moneyness: str | None = None):
         """Return a genuine OpenBB/NSE chain or an explicit unavailable state."""
         provider_configured = _openbb_provider_configured()
-        if not _openbb_url_present():
-            result = {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
-                      "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
-                      "research_only": True, "provider_attempts": {"openbb": False, "nse_fallback": False},
-                      "failure_category": "not_configured", "provider_status": "not_configured",
-                      "explanation": "This module is disabled until a reliable options provider is connected.",
-                      "last_checked": datetime.now(timezone.utc).isoformat(),
-                      "setup_note": "Configure an option-chain capable OpenBB service to enable this module.",
-                      **_banknifty_flags(False, "not_configured")}
-            if _debug_enabled():
-                result["provider_diagnostics"] = [empty_provider_diagnostic("openbb")]
-            return result
         openbb_diag = empty_provider_diagnostic("openbb")
-        openbb_diag["attempted"] = True
-        provider = OpenBBClient(asset_class="index")
-        openbb_diag["final_url"] = (f"{provider.base_url}/api/v1/derivatives/options/chains"
-                                    "?symbol=BANKNIFTY")
+        raw = None
+        spot = None
         try:
-            raw = provider.option_chain("BANKNIFTY", expiry)
-            if not raw.get("contracts"):
-                openbb_diag["failure_category"] = "openbb_empty_chain"
-                openbb_diag["sanitized_error"] = "OpenBB returned no valid BANKNIFTY option rows"
-                raise ValueError("OpenBB returned no BANKNIFTY option contracts")
-            spot = provider.snapshot("^NSEBANK").price
-            verified = build_chain(raw, spot)
-            if not verified["contracts"]:
-                raise ValueError("OpenBB returned no valid BANKNIFTY option contracts")
-            openbb_diag["raw_row_count"] = len(raw["contracts"])
-            openbb_diag["ce_count"] = sum(row.get("option_type", "").upper() in {"CE", "CALL", "C"} for row in raw["contracts"])
-            openbb_diag["pe_count"] = sum(row.get("option_type", "").upper() in {"PE", "PUT", "P"} for row in raw["contracts"])
-            openbb_diag["normalized_contract_count"] = len(verified["contracts"])
+            if provider_configured:
+                openbb_diag["attempted"] = True
+                provider = OpenBBClient(asset_class="index")
+                openbb_diag["final_url"] = (f"{provider.base_url}/api/v1/derivatives/options/chains?symbol=BANKNIFTY")
+                raw = provider.option_chain("BANKNIFTY", expiry)
+                if not raw.get("contracts"):
+                    raise ValueError("OpenBB returned no BANKNIFTY option contracts")
+                spot = provider.snapshot("^NSEBANK").price
+                verified = build_chain(raw, spot)
+                if not verified["contracts"]:
+                    raise ValueError("OpenBB returned no valid BANKNIFTY option contracts")
+                openbb_diag["raw_row_count"] = len(raw["contracts"])
+                openbb_diag["ce_count"] = sum(row.get("option_type", "").upper() in {"CE", "CALL", "C"} for row in raw["contracts"])
+                openbb_diag["pe_count"] = sum(row.get("option_type", "").upper() in {"PE", "PUT", "P"} for row in raw["contracts"])
+                openbb_diag["normalized_contract_count"] = len(verified["contracts"])
+            else:
+                raise RuntimeError("OpenBB is not configured; trying built-in NSE feed")
         except Exception as exc:
-            diagnostics.failure("openbb", exc)
-            openbb_diag["failure_category"] = openbb_diag["failure_category"] or classify_openbb_failure(exc)
-            openbb_diag["sanitized_error"] = openbb_diag["sanitized_error"] or {
-                "openbb_connection_refused": "Local OpenBB service refused the connection",
-                "openbb_option_chain_unsupported": "OpenBB route/provider does not support this option chain",
-                "openbb_empty_chain": "OpenBB returned no valid BANKNIFTY option rows",
-                "openbb_provider_error": "OpenBB option-chain request failed",
-            }[openbb_diag["failure_category"]]
+            if provider_configured:
+                diagnostics.failure("openbb", exc)
+                openbb_diag["failure_category"] = classify_openbb_failure(exc)
+                openbb_diag["sanitized_error"] = "OpenBB option-chain request failed"
             nse = NSEOptionChainClient()
             try:
                 raw = nse.option_chain(expiry)
@@ -512,11 +503,10 @@ def create_app() -> FastAPI:
                             else "temporarily_unavailable")
                 result = {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
                         "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
-                        "research_only": True, "provider_attempts": {"openbb": True, "nse_fallback": True},
+                        "research_only": True, "provider_attempts": {"openbb": provider_configured, "nse_fallback": True},
                         "failure_category": category,
                         "explanation": "Provider attempts completed, but a valid option chain could not be retrieved.",
-                        "provider_status": ("temporarily_unavailable" if provider_configured
-                                            else "not_configured"),
+                        "provider_status": "temporarily_unavailable",
                         "last_checked": datetime.now(timezone.utc).isoformat(),
                         "setup_note": "A reliable options data provider is required for production Bank Nifty option-chain coverage.",
                         **_banknifty_flags(provider_configured, "temporarily_unavailable")}
@@ -527,7 +517,7 @@ def create_app() -> FastAPI:
         # Filters may legitimately select no contracts while the provider remains available.
         result["available"] = True
         result["provider_status"] = "connected"
-        result.update(_banknifty_flags(True, "connected"))
+        result.update(_banknifty_flags(provider_configured, "connected"))
         if _debug_enabled():
             active = openbb_diag if result["source"] == "OpenBB" else nse.diagnostic
             result["provider_diagnostics"] = [openbb_diag] + ([] if active is openbb_diag else [active])
@@ -795,6 +785,12 @@ def create_app() -> FastAPI:
     def paper_positions():
         return _mark_open_positions()
 
+    @app.post("/api/paper/positions/refresh")
+    def refresh_paper_positions():
+        """Refresh genuine marks and run the existing paper-only exit triggers."""
+        positions = _mark_open_positions()
+        return {"positions": positions, "account": paper.account(), "refreshed": len(positions)}
+
     @app.post("/api/paper/positions", status_code=201)
     def open_paper_position(request: OpenPaperPositionRequest):
         if request.market is MarketKind.BANKNIFTY_OPTIONS:
@@ -831,6 +827,29 @@ def create_app() -> FastAPI:
                     price=price, notional=notional, signal=quick, risk_plan=plan)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/paper/positions/close-all")
+    def close_all_paper_positions(request: CloseAllPaperPositionsRequest):
+        if request.confirm is not True:
+            raise HTTPException(400, "Explicit confirmation is required to close all paper trades")
+        closed, failed = 0, 0
+        for position in paper.positions():
+            try:
+                try:
+                    close_price = _paper_quote(position["market"], position["symbol"])
+                    paper.mark(position["id"], close_price)
+                except Exception as exc:
+                    # A close-all action must remain useful during a provider outage:
+                    # retain and use the durable last genuine paper mark.
+                    diagnostics.failure("paper_quote", exc)
+                    paper.mark_unavailable(position["id"])
+                    close_price = position["current_price"]
+                paper.close_position(position["id"], close_price, "manual")
+                closed += 1
+            except Exception as exc:
+                diagnostics.failure("paper_close_all", exc)
+                failed += 1
+        return {"closed": closed, "failed": failed}
 
     @app.post("/api/paper/positions/{position_id}/close")
     def close_paper_position(position_id: str, request: ClosePaperPositionRequest):

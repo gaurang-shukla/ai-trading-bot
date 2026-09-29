@@ -471,3 +471,42 @@ def test_disabled_auto_close_keeps_breach_with_warning(tmp_path: Path, monkeypat
     positions = client.get("/api/paper/positions").json()
     assert len(positions) == 1
     assert positions[0]["position_status"] == "Stop loss breached"
+
+
+def test_refresh_and_close_all_controls_are_in_correct_panels():
+    javascript = Path("src/tradebot/web/app.js").read_text()
+    assert 'id="refresh-paper" class="ghost">Refresh prices' in javascript
+    assert 'paper-panel-header"><p class="eyebrow">OPEN POSITIONS</p>' in javascript
+    assert "positions.length?'<button id=\"close-all-paper\"" in javascript
+    assert "Close every open paper trade now? This cannot be undone." in javascript
+    assert "Refreshing prices…" in javascript
+    assert "Closing all trades…" in javascript
+    assert "if(refresh.disabled)return" in javascript
+    assert "if(closeAll.disabled||!window.confirm" in javascript
+
+
+def test_close_all_requires_confirmation_and_closes_multiple(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGNAL_DB_PATH", str(tmp_path / "close-all.db"))
+    provider = Mock(snapshot=Mock(return_value=Mock(price=105)))
+    monkeypatch.setattr("tradebot.app.default_registry", lambda: Mock(market_data=Mock(return_value=provider)))
+    client = TestClient(create_app())
+    store = client.app.state.paper_store
+    open_trade(store)
+    store.open_position(market="equities", symbol="OTHER", display_name="Other", side="LONG",
+                        price=100, notional=500, signal={"side": "BUY"}, risk_plan={})
+    assert client.post("/api/paper/positions/close-all", json={"confirm": False}).status_code == 400
+    result = client.post("/api/paper/positions/close-all", json={"confirm": True})
+    assert result.status_code == 200
+    assert result.json() == {"closed": 2, "failed": 0}
+    assert store.positions() == []
+
+
+def test_close_all_uses_last_valid_price_when_quote_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGNAL_DB_PATH", str(tmp_path / "close-all-stale.db"))
+    monkeypatch.setattr("tradebot.app.default_registry", lambda: Mock(
+        market_data=Mock(side_effect=RuntimeError("provider secret must not escape"))))
+    client = TestClient(create_app())
+    position = open_trade(client.app.state.paper_store)
+    result = client.post("/api/paper/positions/close-all", json={"confirm": True}).json()
+    assert result == {"closed": 1, "failed": 0}
+    assert client.app.state.paper_store.trades()[0]["exit_price"] == position["current_price"]
