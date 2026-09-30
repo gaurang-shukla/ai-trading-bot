@@ -22,14 +22,15 @@ from .analysis import (CandleCache, DeepJobRegistry, FastAIExplainer, QuickResul
                        QuickSignalEngine, TIMEFRAMES, deterministic_fast_explanation,
                        normalize_deep_reasoning)
 from .assets import asset_metadata, public_metadata
-from .banknifty_options import (NSEOptionChainClient, UNAVAILABLE_MESSAGE,
-                                build_chain, classify_openbb_failure,
-                                empty_provider_diagnostic)
+from .banknifty_options import (DhanOptionChainProvider, NSEOptionChainClient,
+                                NSEOptionChainProvider, OpenBBOptionChainProvider,
+                                OptionChainService, empty_provider_diagnostic)
 from .diagnostics import diagnostics
 from .config import load_project_env
 from .execution import PaperBroker
 from .models import MarketKind, MarketSelection, MarketSnapshot
 from .overview import market_overview
+from .weex_universe import weex_universes
 from .paper import PaperStore
 from .risk import RiskEngine, RiskLimits
 from .service import TradingService
@@ -322,6 +323,7 @@ def integration_status() -> dict:
     inbound_bridge = bool(os.getenv("PAPERCLIP_BRIDGE_TOKEN"))
     outbound_bridge = paperclip.configured
     paperclip_configured = inbound_bridge or outbound_bridge
+    paperclip_enabled = paperclip.enabled or inbound_bridge
     return {
         "openbb": {
             # OpenBB is consumed as a service, so its Python package need not be local.
@@ -339,9 +341,12 @@ def integration_status() -> dict:
         "paperclip": {
             "installed": True,
             "configured": paperclip_configured,
-            "ready": paperclip_configured,
-            "enabled": paperclip_configured,
+            "ready": paperclip_configured and paperclip_enabled,
+            "enabled": paperclip_enabled,
             "role": "optional control and audit bridge",
+            "status_label": ("Optional · Off" if not paperclip_enabled else
+                             "Connected" if paperclip_configured else "Temporarily unavailable"),
+            "description": "Optional control and audit layer. Signal works without it.",
         },
         "weex": {
             "installed": True,
@@ -457,75 +462,49 @@ def create_app() -> FastAPI:
 
     @app.get("/api/banknifty-options")
     def banknifty_options(expiry: str | None = None, option_type: str | None = None,
-                          moneyness: str | None = None):
-        """Return a genuine OpenBB/NSE chain or an explicit unavailable state."""
-        provider_configured = _openbb_provider_configured()
-        openbb_diag = empty_provider_diagnostic("openbb")
-        raw = None
-        spot = None
-        try:
-            if provider_configured:
-                openbb_diag["attempted"] = True
-                provider = OpenBBClient(asset_class="index")
-                openbb_diag["final_url"] = (f"{provider.base_url}/api/v1/derivatives/options/chains?symbol=BANKNIFTY")
-                raw = provider.option_chain("BANKNIFTY", expiry)
-                if not raw.get("contracts"):
-                    raise ValueError("OpenBB returned no BANKNIFTY option contracts")
-                spot = provider.snapshot("^NSEBANK").price
-                verified = build_chain(raw, spot)
-                if not verified["contracts"]:
-                    raise ValueError("OpenBB returned no valid BANKNIFTY option contracts")
-                openbb_diag["raw_row_count"] = len(raw["contracts"])
-                openbb_diag["ce_count"] = sum(row.get("option_type", "").upper() in {"CE", "CALL", "C"} for row in raw["contracts"])
-                openbb_diag["pe_count"] = sum(row.get("option_type", "").upper() in {"PE", "PUT", "P"} for row in raw["contracts"])
-                openbb_diag["normalized_contract_count"] = len(verified["contracts"])
-            else:
-                raise RuntimeError("OpenBB is not configured; trying built-in NSE feed")
-        except Exception as exc:
-            if provider_configured:
-                diagnostics.failure("openbb", exc)
-                openbb_diag["failure_category"] = classify_openbb_failure(exc)
-                openbb_diag["sanitized_error"] = "OpenBB option-chain request failed"
-            nse = NSEOptionChainClient()
-            try:
-                raw = nse.option_chain(expiry)
-                if not raw.get("contracts") or raw.get("underlying_price") is None:
-                    raise ValueError("NSE returned no usable BANKNIFTY option contracts")
-                spot = raw["underlying_price"]
-            except Exception as nse_exc:
-                diagnostics.failure("nse", nse_exc)
-                nse_diag = getattr(nse_exc, "diagnostic", None) or nse.diagnostic
-                if not nse_diag["failure_category"]:
-                    nse_diag["failure_category"] = "nse_empty_chain" if "no usable" in str(nse_exc) else "nse_http_error"
-                    nse_diag["sanitized_error"] = "NSE returned no valid option rows" if "no usable" in str(nse_exc) else "NSE option-chain request failed"
-                category = (nse_diag["failure_category"] if nse_diag["failure_category"] in
-                            {"nse_blocked_by_provider", "nse_http_error", "nse_html_instead_of_json", "nse_empty_chain"}
-                            else "temporarily_unavailable")
-                result = {"available": False, "message": UNAVAILABLE_MESSAGE, "symbol": "BANKNIFTY",
-                        "underlying_symbol": "^NSEBANK", "contracts": [], "expiries": [],
-                        "research_only": True, "provider_attempts": {"openbb": provider_configured, "nse_fallback": True},
-                        "failure_category": category,
-                        "explanation": "Provider attempts completed, but a valid option chain could not be retrieved.",
-                        "provider_status": "temporarily_unavailable",
-                        "last_checked": datetime.now(timezone.utc).isoformat(),
-                        "setup_note": "A reliable options data provider is required for production Bank Nifty option-chain coverage.",
-                        **_banknifty_flags(provider_configured, "temporarily_unavailable")}
-                if _debug_enabled():
-                    result["provider_diagnostics"] = [openbb_diag, nse_diag]
-                return result
-        result = build_chain(raw, spot, expiry, option_type, moneyness)
-        # Filters may legitimately select no contracts while the provider remains available.
-        result["available"] = True
-        result["provider_status"] = "connected"
-        result.update(_banknifty_flags(provider_configured, "connected"))
+                          moneyness: str | None = None, refresh: bool = False):
+        """Read-only normalized chain: DhanHQ, configured OpenBB, then public NSE."""
+        providers = [DhanOptionChainProvider(),
+                     OpenBBOptionChainProvider(lambda: OpenBBClient(asset_class="index")),
+                     NSEOptionChainProvider(lambda: NSEOptionChainClient())]
+        result = OptionChainService(providers).option_chain(
+            "BANKNIFTY", expiry, refresh, option_type, moneyness)
+        attempts = result.get("provider_attempts", [])
+        result["attempted_providers"] = attempts
+        openbb_attempted = next((x["attempted"] for x in attempts if x["provider"] == "OpenBB"), False)
+        nse_attempted = next((x["attempted"] for x in attempts if x["provider"] == "NSE"), False)
+        result.update(_banknifty_flags(openbb_attempted, result["provider_status"]))
+        result["provider_attempts"] = {"openbb": openbb_attempted, "nse_fallback": nse_attempted}
+        if not result["available"]:
+            last_failure = next((x.get("failure_category") for x in reversed(attempts)
+                                 if x.get("attempted") and x.get("failure_category")), "temporarily_unavailable")
+            result.update(failure_category=last_failure,
+                          explanation="Provider attempts completed, but a valid option chain could not be retrieved.",
+                          last_checked=result["application_refreshed_at"])
         if _debug_enabled():
-            active = openbb_diag if result["source"] == "OpenBB" else nse.diagnostic
-            result["provider_diagnostics"] = [openbb_diag] + ([] if active is openbb_diag else [active])
+            diagnostics_rows = []
+            for attempt in attempts:
+                row = empty_provider_diagnostic(attempt["provider"].lower())
+                row.update(attempted=attempt["attempted"], failure_category=attempt.get("failure_category"),
+                           sanitized_error=("Provider request failed" if attempt.get("failure_category") else None))
+                diagnostics_rows.append(row)
+            result["provider_diagnostics"] = diagnostics_rows
         return result
 
     @app.get("/api/markets")
     def markets():
         return default_registry().choices()
+
+    @app.get("/api/assets/search")
+    def asset_search(market: MarketKind, q: str, refresh: bool = False):
+        if market not in {MarketKind.CRYPTO_SPOT, MarketKind.CRYPTO_FUTURES}:
+            raise HTTPException(400, "Complete provider search is available for WEEX markets only.")
+        if not q.strip():
+            return {"market": market.value, "query": q, "found": False, "matches": []}
+        try:
+            return weex_universes.search(market, q, refresh)
+        except Exception as exc:
+            raise _provider_error("WEEX search is temporarily unavailable. Please retry.", exc) from exc
 
     @app.get("/api/assets/{market}/{symbol}/metadata")
     def metadata(market: MarketKind, symbol: str):
@@ -653,6 +632,9 @@ def create_app() -> FastAPI:
             result["stale_after_seconds"] = _freshness_threshold(request.market)
             result["advanced_research_availability"] = advanced_research_availability(request, result)
             quick_results.put(request.market.value, symbol, result)
+            PaperclipReporter().report({"event": "quick_signal_completed", "market": request.market.value,
+                                        "symbol": symbol, "action": str(result["signal"].get("side"))},
+                                       f"quick:{request.market.value}:{symbol}:{snapshot.as_of}")
             return result
         except Exception as exc:
             if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
@@ -822,9 +804,13 @@ def create_app() -> FastAPI:
         default_notional = paper.account()["equity"] * float(plan.get("position_size_pct") or .01)
         notional = request.notional_amount if request.notional_amount is not None else default_notional
         try:
-            return paper.open_position(market=request.market.value, symbol=request.symbol,
+            opened = paper.open_position(market=request.market.value, symbol=request.symbol,
                     display_name=quick.get("display_name") or request.symbol.upper(), side=side,
                     price=price, notional=notional, signal=quick, risk_plan=plan)
+            PaperclipReporter().report({"event": "paper_position_opened", "market": request.market.value,
+                                        "symbol": request.symbol.upper(), "position_id": opened.get("id")},
+                                       f"paper-open:{opened.get('id')}")
+            return opened
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -833,6 +819,7 @@ def create_app() -> FastAPI:
         if request.confirm is not True:
             raise HTTPException(400, "Explicit confirmation is required to close all paper trades")
         closed, failed = 0, 0
+        PaperclipReporter().report({"event": "paper_close_all_requested"})
         for position in paper.positions():
             try:
                 try:
@@ -849,7 +836,9 @@ def create_app() -> FastAPI:
             except Exception as exc:
                 diagnostics.failure("paper_close_all", exc)
                 failed += 1
-        return {"closed": closed, "failed": failed}
+        result = {"closed": closed, "failed": failed}
+        PaperclipReporter().report({"event": "paper_close_all_completed", **result})
+        return result
 
     @app.post("/api/paper/positions/{position_id}/close")
     def close_paper_position(position_id: str, request: ClosePaperPositionRequest):
@@ -858,7 +847,11 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "Open paper position not found")
         try:
             quote_price = _paper_quote(position["market"], position["symbol"])
-            return paper.close_position(position_id, quote_price, "manual")
+            closed = paper.close_position(position_id, quote_price, "manual")
+            PaperclipReporter().report({"event": "paper_position_manually_closed",
+                                        "position_id": position_id, "symbol": position["symbol"]},
+                                       f"paper-close:{position_id}")
+            return closed
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         except KeyError as exc:

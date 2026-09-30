@@ -115,8 +115,13 @@ tradebot BTCUSDT --market crypto_futures --venue weex --date 2026-09-01 --equity
 OpenBB must be reachable at `OPENBB_API_URL` (default `http://127.0.0.1:6900`).
 TradingAgents package layouts are detected at runtime and failures (including its LLM
 provider) become safe HOLD results. TradingAgents requires an enabled LLM provider key
-for full analysis. Paperclip reporting is disabled
-unless `PAPERCLIP_TASK_BRIDGE_URL` and its scoped key are explicitly configured.
+for full analysis. Paperclip is an optional control and audit layer; Signal and Paper
+Trading continue when it is disabled or unreachable. `Optional · Off` means it was
+intentionally disabled, `Connected` means the configured bridge is ready, and
+`Temporarily unavailable` means an enabled bridge could not be reached. Configure
+`PAPERCLIP_ENABLED`, `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY`, and
+`PAPERCLIP_COMPANY_ID`; the legacy `PAPERCLIP_TASK_BRIDGE_URL` remains the pinned
+v0.3.1 event target. Never commit its key.
 
 Set `OPENAI_MODEL` to the model available to your OpenAI project (the default is
 `gpt-4o-mini`). The `/debug` endpoint validates that model against OpenAI when a key is
@@ -125,10 +130,26 @@ including the last success and exact last error. TradingAgents also logs each pi
 stage without logging secret values. Paperclip remains hidden in the home-page health
 strip until its inbound or outbound bridge is explicitly enabled.
 
-The options asset view obtains its chain from OpenBB and exposes expiration and strike
+The BANKNIFTY options view uses one normalized, read-only provider contract. Provider
+priority is authenticated DhanHQ, configured OpenBB, public NSE, then an explicit
+temporary-unavailable response. Configure `BANKNIFTY_OPTIONS_PROVIDER=dhan`, blank
+`DHAN_CLIENT_ID`/`DHAN_ACCESS_TOKEN` placeholders, and optionally
+`DHAN_API_BASE_URL`; missing Dhan credentials fall through automatically. Dhan is
+market-data-only: no order, portfolio, or execution endpoint is present. A future
+provider can implement `OptionChainProvider` without changing the route or UI.
+
+The options asset view exposes expiration and strike
 selection, open interest, implied volatility, available Greeks, put/call ratio and max
 pain. Fields without provider data are rendered as unavailable cells, while selectors
 and summary widgets with no data are omitted.
+
+WEEX spot and futures are kept as separate complete lightweight universes. Search first
+filters ranked/loaded rows, then queries the cached genuine WEEX universe, including
+active low-volume instruments outside the bounded initial ranking view. “Available on
+WEEX” does not mean “ranked opportunity”; an unranked result shows `Not scored yet` and
+can run Quick Signal on demand. Use the refresh controls to rebuild caches. Local setup
+can be verified with `pytest -q`, `python -m compileall -q src tests`, and a temporary
+`SIGNAL_DB_PATH` before starting `signal-app`.
 
 Run the two upstream smoke tests independently before debugging the full application:
 

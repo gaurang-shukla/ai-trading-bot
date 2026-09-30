@@ -1,4 +1,5 @@
 import importlib
+import hashlib
 import json
 import logging
 import os
@@ -574,25 +575,49 @@ def _import_attribute(candidates: tuple[tuple[str, str], ...]):
 
 
 class PaperclipReporter:
-    def __init__(self, base_url: str | None = None, api_key: str | None = None):
+    _sent: set[str] = set()
+    _sent_lock = threading.Lock()
+
+    def __init__(self, base_url: str | None = None, api_key: str | None = None,
+                 transport=None, retries: int = 1):
         self.base_url = (base_url or os.getenv("PAPERCLIP_API_URL", "")).rstrip("/")
         self.api_key = api_key or os.getenv("PAPERCLIP_API_KEY", "")
+        self.company_id = os.getenv("PAPERCLIP_COMPANY_ID", "")
+        self.transport = transport or urlopen
+        self.retries = max(0, min(retries, 2))
 
-    def report(self, event: dict) -> None:
-        """Send an event to an explicitly configured task-bridge endpoint."""
+    @staticmethod
+    def _sanitize(value):
+        sensitive = {"authorization", "api_key", "access_token", "client_id", "secret", "password"}
+        if isinstance(value, dict):
+            return {str(k): ("[redacted]" if str(k).lower() in sensitive else PaperclipReporter._sanitize(v))
+                    for k, v in value.items()}
+        if isinstance(value, list): return [PaperclipReporter._sanitize(v) for v in value]
+        return value
+
+    def report(self, event: dict, idempotency_key: str | None = None) -> dict | None:
+        """Best-effort event delivery to the pinned task bridge; always fail open."""
         endpoint = os.getenv("PAPERCLIP_TASK_BRIDGE_URL", "")
-        if not endpoint:
-            return
-        body = json.dumps(event).encode()
+        if not self.enabled or not endpoint or not self.api_key:
+            return None
+        clean = self._sanitize(event)
+        key = idempotency_key or hashlib.sha256(json.dumps(clean, sort_keys=True, default=str).encode()).hexdigest()
+        with self._sent_lock:
+            if key in self._sent: return {"status": "duplicate", "delivered": False, "idempotency_key": key}
+        body = json.dumps(clean, default=str).encode()
         request = Request(endpoint, data=body, method="POST", headers={
-            "Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"})
-        try:
-            with urlopen(request, timeout=10):
-                pass
-            diagnostics.success("paperclip")
-        except Exception as exc:
-            diagnostics.failure("paperclip", exc)
-            raise
+            "Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}",
+            "Idempotency-Key": key, **({"X-Paperclip-Company-Id": self.company_id} if self.company_id else {})})
+        for attempt in range(self.retries + 1):
+            try:
+                with self.transport(request, timeout=3): pass
+                with self._sent_lock: self._sent.add(key)
+                diagnostics.success("paperclip")
+                return {"status": "delivered", "delivered": True, "idempotency_key": key}
+            except Exception as exc:
+                diagnostics.failure("paperclip", exc)
+                if attempt < self.retries: time.sleep(.1 * 2 ** attempt)
+        return {"status": "temporarily_unavailable", "delivered": False, "idempotency_key": key}
 
     @property
     def configured(self) -> bool:
@@ -600,4 +625,5 @@ class PaperclipReporter:
 
     @property
     def enabled(self) -> bool:
-        return os.getenv("PAPERCLIP_ENABLED", "").lower() in {"1", "true", "yes"} or self.configured
+        explicit = os.getenv("PAPERCLIP_ENABLED", "").lower()
+        return explicit in {"1", "true", "yes"} or (explicit == "" and self.configured)
