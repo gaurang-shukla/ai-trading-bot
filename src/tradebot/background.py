@@ -146,6 +146,8 @@ class Scanner(Job):
         self.concurrency = max(1, min(4, concurrency))
         self.rate_lock = threading.Lock()
         self.last_request = 0.0
+        self.provider_failures = {}
+        self.cooldowns = {}
         self.state.update(instruments_considered=0, instruments_analysed=0)
 
     def latest(self):
@@ -168,10 +170,23 @@ class Scanner(Job):
             return None
         # Pace symbol starts as well as bounding concurrency. Provider caches handle repeat reads.
         with self.rate_lock:
+            if time.monotonic() < self.cooldowns.get(market, 0):
+                return None
             if self.stop_event.wait(max(0, .25 - (time.monotonic() - self.last_request))):
                 return None
             self.last_request = time.monotonic()
-        quick = self.analyze(market, row["symbol"])
+        try:
+            quick = self.analyze(market, row["symbol"])
+        except Exception:
+            with self.rate_lock:
+                failures = self.provider_failures.get(market, 0) + 1
+                self.provider_failures[market] = failures
+                if failures >= 3:
+                    # Stop queued requests after repeated outages/rate limits; no immediate retries.
+                    self.cooldowns[market] = time.monotonic() + 60
+            raise
+        with self.rate_lock:
+            self.provider_failures[market] = 0
         price = float(quick["live_price"])
         timestamp = datetime.fromisoformat(quick["last_updated"].replace("Z", "+00:00"))
         if not math.isfinite(price) or price <= 0 or timestamp.tzinfo is None:

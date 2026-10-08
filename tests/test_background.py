@@ -130,8 +130,8 @@ def test_risk_limits_enforced_in_transaction(tmp_path):
 @pytest.mark.parametrize('quote,reason,fill', [(80, 'stop_loss', 90), (130, 'take_profit', 120)])
 def test_background_monitor_and_duplicate_closes(tmp_path, monkeypatch, quote, reason, fill):
     monkeypatch.setenv('SIGNAL_DB_PATH', str(tmp_path / 'monitor.db'))
-    provider = Mock(snapshot=Mock(return_value=Mock(price=quote)))
-    monkeypatch.setattr('tradebot.app.default_registry', lambda: Mock(market_data=Mock(return_value=provider)))
+    provider = Mock(snapshot=Mock(return_value=Mock(price=quote, source="weex_spot_v3")))
+    monkeypatch.setattr('tradebot.app.WeexSpotMarketData', lambda: provider)
     app = create_app()
     store = app.state.paper_store
     pos = store.open_position(market='crypto_spot', symbol='TESTUSDT', display_name='Test', side='LONG',
@@ -141,7 +141,7 @@ def test_background_monitor_and_duplicate_closes(tmp_path, monkeypatch, quote, r
     trades = store.trades()
     assert len(trades) == 1 and trades[0]['close_reason'] == reason
     assert trades[0]['exit_price'] == fill and trades[0]['evaluated_price'] == quote
-    assert trades[0]['price_provider'] == 'WEEX' and trades[0]['evaluated_at']
+    assert trades[0]['price_provider'] == 'weex_spot_v3' and trades[0]['evaluated_at']
     with pytest.raises(KeyError):
         store.close_position(pos['id'], quote)
     assert app.state.paper_monitor.status()['last_successful_evaluation']
@@ -149,7 +149,7 @@ def test_background_monitor_and_duplicate_closes(tmp_path, monkeypatch, quote, r
 
 def test_quote_outage_retains_mark(tmp_path, monkeypatch):
     monkeypatch.setenv('SIGNAL_DB_PATH', str(tmp_path / 'outage.db'))
-    monkeypatch.setattr('tradebot.app.default_registry', Mock(side_effect=RuntimeError('outage')))
+    monkeypatch.setattr('tradebot.app.WeexFuturesMarketData', Mock(side_effect=RuntimeError('outage')))
     app = create_app()
     store = app.state.paper_store
     store.open_position(market='crypto_futures', symbol='TESTUSDT', display_name='Test', side='LONG',
@@ -242,3 +242,57 @@ def test_lifespan_runs_and_stops_background_jobs(tmp_path, monkeypatch):
         assert app.state.paper_monitor.thread.is_alive()
     assert not app.state.scanner.thread.is_alive()
     assert not app.state.paper_monitor.thread.is_alive()
+
+
+def test_scanner_never_uses_research_fallback_or_its_candle_cache(tmp_path, monkeypatch):
+    from tradebot.analysis import CandleCache
+    from tradebot.app import quick_results
+    from tradebot.models import MarketSnapshot
+    monkeypatch.setenv('SIGNAL_DB_PATH', str(tmp_path / 'strict.db'))
+    monkeypatch.setattr('tradebot.app.default_registry', Mock(side_effect=AssertionError('No fallback allowed')))
+    spot = Mock(snapshot=Mock(return_value=MarketSnapshot('STRICTUSDT', 100, now(), 'weex_spot_v3', 3, 10000)), candles=Mock(return_value=[]))
+    futures = Mock(snapshot=Mock(return_value=MarketSnapshot('STRICTUSDT', 101, now(), 'weex_futures_v3', 3, 10000)), candles=Mock(return_value=[]))
+    monkeypatch.setattr('tradebot.app.WeexSpotMarketData', lambda: spot)
+    monkeypatch.setattr('tradebot.app.WeexFuturesMarketData', lambda: futures)
+    cache = CandleCache()
+    monkeypatch.setattr('tradebot.app.candle_cache', cache)
+    quick_results.put('crypto_spot', 'STRICTUSDT', {**quick(MarketKind.CRYPTO_SPOT, 'STRICTUSDT'), 'source': 'yahoo', 'live_price': 999})
+    scanner = create_app().state.scanner
+    result = scanner.analyze(MarketKind.CRYPTO_SPOT, 'STRICTUSDT')
+    assert result['source'] == 'weex_spot_v3' and result['live_price'] == 100
+    assert scanner.analyze(MarketKind.CRYPTO_FUTURES, 'STRICTUSDT')['live_price'] == 101
+    assert spot.candles.called and futures.candles.called
+    scanner.analyze(MarketKind.CRYPTO_SPOT, 'STRICTUSDT')
+    assert spot.snapshot.call_count == 1  # The scanner's verified-only Quick Signal cache.
+
+
+def test_manual_close_racing_monitor_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv('SIGNAL_DB_PATH', str(tmp_path / 'race.db'))
+    entered, release = threading.Event(), threading.Event()
+    def quote(symbol):
+        entered.set()
+        assert release.wait(5)
+        return Mock(price=80, source='weex_spot_v3')
+    monkeypatch.setattr('tradebot.app.WeexSpotMarketData', lambda: Mock(snapshot=quote))
+    app = create_app()
+    store = app.state.paper_store
+    pos = store.open_position(market='crypto_spot', symbol='RACEUSDT', display_name='Test', side='LONG',
+        price=100, notional=1000, signal='BUY', risk_plan={'stop_loss': 90})
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monitoring = pool.submit(app.state.paper_monitor.run)
+        assert entered.wait(2)
+        store.close_position(pos['id'], 100, 'manual')
+        release.set()
+        assert monitoring.result(timeout=5)
+    assert len(store.trades()) == 1 and store.trades()[0]['close_reason'] == 'manual'
+    assert store.account()['cash_balance'] == 100000
+
+
+def test_scanner_circuit_breaker_limits_provider_outage_requests(tmp_path):
+    analyze = Mock(side_effect=RuntimeError('provider rate limit'))
+    job = Scanner(local(tmp_path), universe(30), analyze, candidates=20, concurrency=2)
+    job.run()
+    # At most one already-started peer can exceed the three-failure threshold per market.
+    assert analyze.call_count <= 8
+    assert job.latest()['stale'] and job.latest()['results'] == []
+    assert job.status()['failures'] > 0

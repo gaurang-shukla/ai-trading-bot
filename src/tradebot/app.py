@@ -19,7 +19,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient, research_symbol
+from .adapters import (OpenBBClient, PaperclipReporter, TradingAgentsClient, research_symbol,
+                       WeexSpotMarketData, WeexFuturesMarketData)
 from .analysis import (CandleCache, DeepJobRegistry, FastAIExplainer, QuickResultCache,
                        QuickSignalEngine, TIMEFRAMES, deterministic_fast_explanation,
                        normalize_deep_reasoning)
@@ -444,7 +445,7 @@ def create_app() -> FastAPI:
     @app.get("/api/status")
     def status():
         return {"mode": "paper", "integrations": integration_status(),
-                "scanner": scanner.status(), "paper_monitor": monitor.status()}
+                "scanner": scanner_status(), "paper_monitor": monitor_status()}
 
     @app.get("/debug")
     def debug():
@@ -584,8 +585,12 @@ def create_app() -> FastAPI:
 
     @app.post("/api/analyze/quick")
     def quick_analyze(request: AnalyzeRequest):
+        return _quick_analyze(request)
+
+    def _quick_analyze(request: AnalyzeRequest, provider=None, report=True):
+        strict_provider = provider is not None
         try:
-            provider = market_data(request)
+            provider = provider or market_data(request)
             symbol = request.symbol.upper()
             snapshot = provider.snapshot(symbol)
             histories, warnings = {}, []
@@ -594,7 +599,7 @@ def create_app() -> FastAPI:
             timeframes = (("5m", "15m", "1h", "1d")
                           if request.market is MarketKind.INDIAN_INDICES else TIMEFRAMES)
             executor = ThreadPoolExecutor(max_workers=len(timeframes), thread_name_prefix="quick-candles")
-            futures = {executor.submit(candle_cache.get_or_load, f"{request.market.value}:{symbol}", frame,
+            futures = {executor.submit(candle_cache.get_or_load, f"{'weex-only:' if strict_provider else ''}{request.market.value}:{symbol}", frame,
                        lambda f=frame: provider.candles(symbol, f, 250), request.refresh): frame
                        for frame in timeframes}
             candle_timeout = max(.05, float(os.getenv("SIGNAL_QUICK_CANDLE_TIMEOUT_SECONDS", "8")))
@@ -643,9 +648,10 @@ def create_app() -> FastAPI:
             result["stale_after_seconds"] = _freshness_threshold(request.market)
             result["advanced_research_availability"] = advanced_research_availability(request, result)
             quick_results.put(request.market.value, symbol, result)
-            PaperclipReporter().report({"event": "quick_signal_completed", "market": request.market.value,
-                                        "symbol": symbol, "action": str(result["signal"].get("side"))},
-                                       f"quick:{request.market.value}:{symbol}:{snapshot.as_of}")
+            if report:
+                PaperclipReporter().report({"event": "quick_signal_completed", "market": request.market.value,
+                                            "symbol": symbol, "action": str(result["signal"].get("side"))},
+                                           f"quick:{request.market.value}:{symbol}:{snapshot.as_of}")
             return result
         except Exception as exc:
             if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
@@ -743,13 +749,18 @@ def create_app() -> FastAPI:
         return deep_jobs.start(request.market.value, request.symbol, perform, fallback,
                                refresh=request.refresh)
 
-    def _paper_quote(market: str, symbol: str) -> float:
+    def _paper_snapshot(market: str, symbol: str, strict=False):
         selection = MarketSelection(MarketKind(market), "weex" if market.startswith("crypto_") else "openbb",
                                     symbol.upper())
-        price = float(default_registry().market_data(selection).snapshot(symbol.upper()).price)
+        provider = (WeexFuturesMarketData() if market == "crypto_futures" else WeexSpotMarketData()) if strict and market.startswith("crypto_") else default_registry().market_data(selection)
+        snapshot = provider.snapshot(symbol.upper())
+        price = float(snapshot.price)
         if not math.isfinite(price) or price <= 0:
             raise ValueError("Live price is missing or invalid")
-        return price
+        return snapshot
+
+    def _paper_quote(market: str, symbol: str) -> float:
+        return float(_paper_snapshot(market, symbol).price)
 
     def _mark_open_positions() -> list[dict]:
         # Serialize background and manual refreshes; SQLite serializes all closes.
@@ -758,11 +769,12 @@ def create_app() -> FastAPI:
                 if monitor.stop_event.is_set():
                     break
                 try:
-                    price = _paper_quote(position["market"], position["symbol"])
-                    provider = "WEEX" if position["market"].startswith("crypto_") else "OpenBB"
+                    snapshot = _paper_snapshot(position["market"], position["symbol"], strict=True)
+                    price = float(snapshot.price)
+                    provider = snapshot.source if isinstance(snapshot.source, str) else "public market provider"
                     paper.mark(position["id"], price, provider=provider)
-                    marked = next((item for item in paper.positions() if item["id"] == position["id"]), None)
-                    reason = paper.trigger_reason(marked) if marked else None
+                    marked = {**position, "current_price": price}
+                    reason = paper.trigger_reason(marked)
                     auto_close = os.getenv("PAPER_AUTO_CLOSE_STOPS", "true").strip().lower() not in {"0", "false", "no", "off"}
                     if reason and auto_close:
                         # Preserve existing simulated threshold fills; separately record the genuine evaluated quote.
@@ -780,8 +792,21 @@ def create_app() -> FastAPI:
                     monitor.state["last_successful_evaluation"] = datetime.now(timezone.utc).isoformat()
             return positions
 
-    scanner = Scanner(local_state, weex_universes,
-                      lambda market, symbol: quick_results.get(market.value, symbol) or quick_analyze(AnalyzeRequest(market=market, symbol=symbol, venue="weex")),
+    scanner_quick_results = QuickResultCache()
+
+    def scanner_analyze(market, symbol):
+        cached = scanner_quick_results.get(market.value, symbol)
+        expected_source = "weex_spot_v3" if market is MarketKind.CRYPTO_SPOT else "weex_futures_v3"
+        if cached and cached.get("source") == expected_source:
+            return cached
+        provider = WeexSpotMarketData() if market is MarketKind.CRYPTO_SPOT else WeexFuturesMarketData()
+        # Research fallbacks may represent a different venue. Scanner candles and
+        # snapshots must remain WEEX-only and use an isolated candle cache key.
+        result = _quick_analyze(AnalyzeRequest(market=market, symbol=symbol, venue="weex"), provider, report=False)
+        scanner_quick_results.put(market.value, symbol, result)
+        return result
+
+    scanner = Scanner(local_state, weex_universes, scanner_analyze,
                       candidates=int(os.getenv("SCANNER_CANDIDATES_PER_MARKET", "12")),
                       concurrency=int(os.getenv("SCANNER_CONCURRENCY", "2")))
     monitor = PaperMonitor(local_state, _mark_open_positions)

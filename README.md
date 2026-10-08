@@ -190,6 +190,10 @@ proxy when the range is unavailable). It analyses up to 12 candidates per market
 through the existing multi-timeframe Quick Signal engine, with two concurrent
 symbols and at least 250 ms between symbol starts. Provider requests retain their
 transport timeouts, and universe/candle/Quick Signal caches protect repeated reads.
+Three consecutive analysis-provider failures trigger a 60-second per-market
+circuit breaker that stops queued requests, with no immediate retry storm. Scanner
+quotes/candles and crypto monitor quotes use WEEX-only adapters; generic research
+fallbacks cannot substitute another venue.
 Manual runs return HTTP 409 while another scan is running. Scheduled scans default
 to five minutes; an interval is measured after completion, so scans cannot overlap.
 No scanner result automatically opens a position.
