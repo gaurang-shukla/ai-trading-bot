@@ -180,3 +180,97 @@ Pinned revisions are listed in `UPSTREAMS.lock`. TradingAgents is Apache-2.0 and
 Paperclip is MIT. OpenBB is AGPL-3.0-only; this design consumes OpenBB across a
 service/API boundary. Deployment and distribution obligations should be reviewed by
 qualified counsel. This software is experimental and is not investment advice.
+
+## Automated WEEX research and background paper monitoring
+
+The **Scanner** navigation page prefilters genuine active WEEX spot and futures
+universes separately using reported turnover (liquidity proxy) and absolute
+24-hour movement plus the reported high/low range (movement is the volatility
+proxy when the range is unavailable). It analyses up to 12 candidates per market
+through the existing multi-timeframe Quick Signal engine, with two concurrent
+symbols and at least 250 ms between symbol starts. Provider requests retain their
+transport timeouts, and universe/candle/Quick Signal caches protect repeated reads.
+Manual runs return HTTP 409 while another scan is running. Scheduled scans default
+to five minutes; an interval is measured after completion, so scans cannot overlap.
+No scanner result automatically opens a position.
+
+Results and validated risk settings live in the existing local SQLite database
+(`SIGNAL_DB_PATH`, default `data/signal.db`), never in Git. A restart retains the
+last useful results; unavailable markets retain their old rows with stale flags
+and original data timestamps. Initial outages show unavailable/empty states,
+without invented instruments or prices. Funding is reported only when the WEEX
+bulk ticker supplies it. Order-book imbalance and open interest/change are
+currently explicitly unavailable; scanner confidence is reduced for missing
+supplemental fields. These are heuristic research confidence/probability values,
+not calibrated return guarantees.
+
+The application lifespan starts a separate paper monitor (default 60 seconds).
+It refreshes genuine quotes and reuses saved stop/target trigger logic. SQLite
+transactions prevent duplicate closes across manual and background operations.
+Automatic fills preserve the existing simulated stop/target prices; closed trades
+also record the actual evaluated quote, evaluation time and provider. Quote outages
+retain stored marks, visibly flagged stale. Paperclip is optional and fail-open.
+Stop workers through normal application shutdown; use **one Uvicorn worker** so
+there is one scanner/monitor scheduler for a database. No real orders, withdrawals,
+broker execution or credential routes are added.
+
+Paper Trading exposes locally saved risk settings. Percentage settings use
+0–100 units. Existing 1x margin/account calculations are preserved by default;
+allocation/exposure/loss ceilings default to 100%, position count to 100, stop/target
+fallbacks to 2%/4%. Signal-provided levels take precedence. The optional 1–10x
+**simulated paper leverage** multiplies futures quantity/P&L only; spot remains
+1x. Margin reserves the entered amount, while exposure checks use full leveraged
+notional. Leverage is saved per position, so later setting changes do not alter
+existing trades. The loss circuit breaker measures net UTC-day realized P&L against
+the original starting balance. These controls never enable live execution.
+
+### Research API
+
+All responses are JSON; HTTP 422 indicates invalid settings, HTTP 409 a duplicate
+manual scan, and HTTP 202 an accepted background scan. Provider errors are sanitized.
+
+| Endpoint | Contract |
+| --- | --- |
+| `GET /api/scanner/status` | running/state, last completed, duration, considered/analysed counts, next scan, cumulative failures, stale |
+| `GET /api/scanner/results` | results, per-market availability, data timestamp, attempt time, stale |
+| `POST /api/scanner/run` | accepts a bounded run; concurrent submissions return 409 |
+| `GET /api/paper/monitor/status` | running/state, last successful evaluation, next evaluation, stale, failures |
+| `GET /api/paper/settings` | complete locally persisted risk settings |
+| `PUT /api/paper/settings` | partial object of validated known settings; returns complete settings |
+| `GET /api/status` | paper mode, existing integrations, scanner and monitor diagnostics |
+
+Result rows include market/symbol/action, opportunity score, confidence/probability,
+risk, entry reference, stop/target, suggested allocation fraction, timeframe rows,
+momentum/volatility summaries, supplemental nullable values, explanation and timestamp.
+Missing supplemental values are `null` and named in `unavailable_fields`, never fake zeroes.
+Interval ranges are scanner 60–86400 seconds and monitor 5–3600 seconds; position
+count 1–1000; allocation/exposure/loss percentages 0.1–100; stop 0.1–50%; target
+0.1–100%; futures simulated leverage 1–10x. Interval changes apply after the current
+wait. Existing positions retain their saved levels.
+
+### Local verification and CI protection
+
+```bash
+python -m venv --system-site-packages .venv
+. .venv/bin/activate
+python -m pip install -e '.[dev]'
+pytest -q
+python -m compileall -q src tests
+node --check src/tradebot/web/app.js
+git ls-files -z '*.js' | xargs -0 -r -n 1 node --check
+git diff --check
+python -m uvicorn tradebot.app:app --host 127.0.0.1 --port 8787
+```
+
+The mocked tests cover HTML/API smoke routes, JavaScript parsing and a separate
+15-second shell loading-recovery message. The service-worker shell cache is versioned,
+uses network-first revalidation, activates promptly and removes only older Signal
+shell caches. CI runs on every pull request and push to main with no live provider
+credentials required. Configure the GitHub `main` branch ruleset to require
+**Required paper regression checks** before merging, with branch deletion/force pushes
+blocked as appropriate. A workflow file alone cannot enforce mandatory branch
+protection; that requires repository administration access.
+
+Public research requires HTTPS access to `api-spot.weex.com` and
+`api-contract.weex.com`. Provider outages remain explicit, and BANKNIFTY keeps its
+existing research-only provider behavior.

@@ -137,6 +137,12 @@ class PaperStore:
                 db.execute("ALTER TABLE paper_trades ADD COLUMN entry_notional REAL")
             if "exit_value" not in trade_columns:
                 db.execute("ALTER TABLE paper_trades ADD COLUMN exit_value REAL")
+            for name, kind in (("price_provider", "TEXT"), ("evaluated_at", "TEXT"), ("paper_leverage", "REAL NOT NULL DEFAULT 1")):
+                if name not in position_columns:
+                    db.execute(f"ALTER TABLE paper_positions ADD COLUMN {name} {kind}")
+            for name, kind in (("price_provider", "TEXT"), ("evaluated_at", "TEXT"), ("evaluated_price", "REAL")):
+                if name not in trade_columns:
+                    db.execute(f"ALTER TABLE paper_trades ADD COLUMN {name} {kind}")
             for name in ("max_price", "min_price"):
                 if name not in position_columns:
                     db.execute(f"ALTER TABLE paper_positions ADD COLUMN {name} REAL")
@@ -209,13 +215,13 @@ class PaperStore:
         return {"stop_loss": "Stop loss breached", "take_profit": "Take profit reached"}.get(
             cls.trigger_reason(position), "Active")
 
-    def mark(self, position_id: str, price: float) -> None:
+    def mark(self, position_id: str, price: float, provider: str | None = None) -> None:
         price = _positive_number(price, "Current price")
         with self._lock, self._database() as db:
-            db.execute("UPDATE paper_positions SET current_price=?,price_available=1,"
+            db.execute("UPDATE paper_positions SET current_price=?,price_available=1,price_provider=?,evaluated_at=?,"
                        "max_price=MAX(COALESCE(max_price,entry_price),?),"
                        "min_price=MIN(COALESCE(min_price,entry_price),?) "
-                       "WHERE id=? AND status='open'", (price, price, price, position_id))
+                       "WHERE id=? AND status='open'", (price, provider, _now(), price, price, position_id))
 
     def mark_unavailable(self, position_id: str) -> None:
         """Retain the last valid price while making its stale/unavailable state explicit."""
@@ -239,12 +245,13 @@ class PaperStore:
 
     def open_position(self, *, market: str, symbol: str, display_name: str, side: str,
                       price: float, notional: float, signal: dict | str,
-                      risk_plan: dict | None = None) -> dict:
+                      risk_plan: dict | None = None, settings: dict | None = None) -> dict:
         if side not in {"LONG", "SHORT"}:
             raise ValueError("Side must be LONG or SHORT")
         price = _positive_number(price, "Live price")
         notional = _positive_number(notional, "Notional amount")
-        quantity = notional / price
+        leverage = settings["futures_paper_leverage"] if settings and market == "crypto_futures" else 1
+        quantity = notional * leverage / price
         if not math.isfinite(quantity) or not (0 < quantity <= 1e18):
             raise ValueError("Calculated quantity is invalid")
         # Callers may provide the complete Quick Signal result.  Keep the legacy
@@ -258,6 +265,13 @@ class PaperStore:
         )
         plan = quick.get("risk_plan") if isinstance(quick.get("risk_plan"), dict) else risk_plan
         plan = plan if isinstance(plan, dict) else {}
+        plan = dict(plan)
+        if settings:
+            direction = 1 if side == "LONG" else -1
+            if plan.get("stop_loss") is None:
+                plan["stop_loss"] = price * (1 - direction * settings["default_stop_loss_pct"] / 100)
+            if plan.get("take_profit") is None:
+                plan["take_profit"] = price * (1 + direction * settings["default_take_profit_pct"] / 100)
         levels = quick.get("key_levels") if isinstance(quick.get("key_levels"), dict) else {}
         volatility = quick.get("volatility_summary") if isinstance(quick.get("volatility_summary"), dict) else {}
         momentum = quick.get("momentum_summary") if isinstance(quick.get("momentum_summary"), dict) else {}
@@ -265,7 +279,7 @@ class PaperStore:
             "market": market, "symbol": symbol.upper(), "display_name": display_name,
             "side": side, "source": "Quick Signal", "signal": source_signal,
             "advanced_research_decision": quick.get("advanced_research_decision") or quick.get("deep_research"),
-            "entry_price": price, "stop_loss": plan.get("stop_loss"),
+            "entry_price": price, "paper_leverage": leverage, "stop_loss": plan.get("stop_loss"),
             "take_profit": plan.get("take_profit"), "risk_score": plan.get("risk_score"),
             "confidence": source_signal.get("confidence", quick.get("confidence")),
             "opportunity_score": quick.get("opportunity_score"),
@@ -292,11 +306,25 @@ class PaperStore:
                 "risk_score": plan.get("risk_score"), "confidence": source_signal.get("confidence", quick.get("confidence")),
                 "position_size_pct": plan.get("position_size_pct"), "opened_at": _now(),
                 "source_signal_action": str(source_signal.get("side", "HOLD")), "status": "open",
-                "signal_snapshot": snapshot, "max_price": price, "min_price": price}
+                "signal_snapshot": snapshot, "paper_leverage": leverage, "max_price": price, "min_price": price}
         with self._lock, self._database() as db:
             # BEGIN IMMEDIATE serializes the balance check across processes and
             # across multiple PaperStore instances, not only threads in this instance.
             db.execute("BEGIN IMMEDIATE")
+            if settings:
+                account = db.execute("SELECT * FROM paper_account WHERE id=1").fetchone()
+                rows = db.execute("SELECT * FROM paper_positions WHERE status='open'").fetchall()
+                equity = account["cash_balance"] + sum(r["notional_value"] + self.pnl(r["side"], r["entry_price"], r["current_price"], r["quantity"]) for r in rows)
+                exposure = sum(r["notional_value"] * r["paper_leverage"] for r in rows)
+                daily_pnl = db.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM paper_trades WHERE substr(closed_at,1,10)=?", (_now()[:10],)).fetchone()[0]
+                if len(rows) >= settings["max_open_positions"]:
+                    raise ValueError("Maximum simultaneous paper positions reached")
+                if notional > equity * settings["max_position_allocation_pct"] / 100:
+                    raise ValueError("Maximum paper position allocation exceeded")
+                if exposure + notional * leverage > equity * settings["max_total_exposure_pct"] / 100:
+                    raise ValueError("Maximum total paper exposure exceeded")
+                if daily_pnl <= -account["starting_balance"] * settings["daily_loss_limit_pct"] / 100:
+                    raise ValueError("Daily paper-loss limit reached")
             duplicate = db.execute(
                 "SELECT 1 FROM paper_positions WHERE market=? AND symbol=? AND status='open'",
                 (market, item["symbol"]),
@@ -314,7 +342,7 @@ class PaperStore:
         position_id = item["id"]
         return next(position for position in self.positions() if position["id"] == position_id)
 
-    def close_position(self, position_id: str, price: float, reason: str = "manual") -> dict:
+    def close_position(self, position_id: str, price: float, reason: str = "manual", provider: str | None = None, evaluated_price: float | None = None) -> dict:
         price = _positive_number(price, "Live price")
         if not isinstance(reason, str):
             raise ValueError("Close reason must be text")
@@ -334,6 +362,7 @@ class PaperStore:
                      "realized_pnl_pct": profit / position["notional_value"] * 100,
                      "opened_at": position["opened_at"], "closed_at": _now(),
                      "close_reason": reason, "signal_snapshot": position["signal_snapshot"],
+                     "price_provider": provider, "evaluated_at": _now(), "evaluated_price": evaluated_price if evaluated_price is not None else price,
                      "entry_notional": position["notional_value"],
                      "exit_value": position["notional_value"] + profit}
             db.execute("UPDATE paper_positions SET status='closed',current_price=? WHERE id=?", (price, position_id))
