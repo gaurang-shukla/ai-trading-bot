@@ -757,6 +757,10 @@ def create_app() -> FastAPI:
         price = float(snapshot.price)
         if not math.isfinite(price) or price <= 0:
             raise ValueError("Live price is missing or invalid")
+        if strict and isinstance(snapshot.as_of, str):
+            timestamp = datetime.fromisoformat(snapshot.as_of.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None or (datetime.now(timezone.utc) - timestamp).total_seconds() > _freshness_threshold(MarketKind(market)):
+                raise ValueError("Provider quote is stale")
         return snapshot
 
     def _paper_quote(market: str, symbol: str) -> float:

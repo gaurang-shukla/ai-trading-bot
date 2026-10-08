@@ -177,6 +177,12 @@ class Scanner(Job):
             self.last_request = time.monotonic()
         try:
             quick = self.analyze(market, row["symbol"])
+            price = float(quick["live_price"])
+            timestamp = datetime.fromisoformat(quick["last_updated"].replace("Z", "+00:00"))
+            if not math.isfinite(price) or price <= 0 or timestamp.tzinfo is None:
+                raise ValueError("invalid provider quote")
+            if (datetime.now(timezone.utc) - timestamp).total_seconds() > quick.get("stale_after_seconds", 600):
+                raise ValueError("stale provider quote")
         except Exception:
             with self.rate_lock:
                 failures = self.provider_failures.get(market, 0) + 1
@@ -187,12 +193,6 @@ class Scanner(Job):
             raise
         with self.rate_lock:
             self.provider_failures[market] = 0
-        price = float(quick["live_price"])
-        timestamp = datetime.fromisoformat(quick["last_updated"].replace("Z", "+00:00"))
-        if not math.isfinite(price) or price <= 0 or timestamp.tzinfo is None:
-            raise ValueError("invalid provider quote")
-        if (datetime.now(timezone.utc) - timestamp).total_seconds() > quick.get("stale_after_seconds", 600):
-            raise ValueError("stale provider quote")
         signal, plan = quick["signal"], quick["risk_plan"]
         action = str(getattr(signal["side"], "value", signal["side"])).removeprefix("Side.")
         action = {"STRONG_BUY": "BUY", "STRONG_SELL": "SELL"}.get(action, action)

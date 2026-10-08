@@ -296,3 +296,21 @@ def test_scanner_circuit_breaker_limits_provider_outage_requests(tmp_path):
     assert analyze.call_count <= 8
     assert job.latest()['stale'] and job.latest()['results'] == []
     assert job.status()['failures'] > 0
+
+
+def test_old_provider_quotes_cannot_trigger_monitor_or_new_scanner_results(tmp_path, monkeypatch):
+    from tradebot.models import MarketSnapshot
+    old = '2000-01-01T00:00:00+00:00'
+    monkeypatch.setenv('SIGNAL_DB_PATH', str(tmp_path / 'old-quotes.db'))
+    monkeypatch.setattr('tradebot.app.WeexSpotMarketData', lambda: Mock(snapshot=Mock(return_value=MarketSnapshot('OLDUSDT', 80, old, 'weex_spot_v3'))))
+    app = create_app()
+    store = app.state.paper_store
+    store.open_position(market='crypto_spot', symbol='OLDUSDT', display_name='Old', side='LONG', price=100,
+        notional=1000, signal='BUY', risk_plan={'stop_loss': 90})
+    app.state.paper_monitor.run()
+    assert not store.trades() and store.positions()[0]['current_price'] == 100
+    assert not store.positions()[0]['price_available']
+    analyze = Mock(side_effect=lambda m,s: {**quick(m,s), 'last_updated': old})
+    scanner = Scanner(local(tmp_path), universe(20), analyze, candidates=15)
+    scanner.run()
+    assert analyze.call_count <= 8 and scanner.latest()['stale'] and not scanner.latest()['results']
