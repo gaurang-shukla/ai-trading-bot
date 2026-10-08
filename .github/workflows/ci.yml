@@ -1,0 +1,30 @@
+name: Paper research CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  regression:
+    name: Required paper regression checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PAPERCLIP_ENABLED: 'false'
+      SIGNAL_DB_PATH: /tmp/ci-signal.db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -e '.[dev]'
+      - run: pytest -q
+      - run: python -m compileall -q src tests
+      - run: git diff --check
+      - run: node --check src/tradebot/web/app.js
+      - name: Validate every project JavaScript file
+        run: git ls-files -z '*.js' | xargs -0 -r -n 1 node --check

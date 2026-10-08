@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 import os
 import re
 import threading
@@ -106,12 +107,18 @@ class WeexUniverseService:
             if not base or not quote: invalid += 1; continue
             seen.add(symbol)
             price = row.get("lastPrice") or row.get("last") or row.get("markPrice") or row.get("price")
+            high, low, last = _number(row.get("highPrice")), _number(row.get("lowPrice")), _number(price)
+            volatility = (high - low) / last * 100 if high is not None and low is not None and last and last > 0 and high >= low else None
             instruments.append({"symbol": symbol, "provider_symbol": provider_symbol,
                 "display_symbol": f"{base}/{quote}", "base_asset": base, "quote_asset": quote,
                 "status": "trading", "price": _number(price), "mark_price": _number(row.get("markPrice")),
                 "change": normalize_weex_24h_change(row),
                 "volume": _number(row.get("quoteVolume") or row.get("turnover") or row.get("volume")),
-                "funding_rate": _number(row.get("fundingRate") or row.get("lastFundingRate")),
+                "funding_rate": _number(row.get("fundingRate") if row.get("fundingRate") is not None else row.get("lastFundingRate")),
+                "order_book_imbalance": _number(row.get("orderBookImbalance")),
+                "open_interest": _number(row.get("openInterest")),
+                "open_interest_change": _number(row.get("openInterestChange")),
+                "volatility_24h": volatility,
                 "available_on_weex": True, "ranked": False})
         now = datetime.now(timezone.utc).isoformat()
         return {"market": market.value, "source": "WEEX", "instruments": instruments,
@@ -143,7 +150,9 @@ class WeexUniverseService:
 
 
 def _number(value):
-    try: return float(value) if value is not None and value != "" else None
+    try:
+        number = float(value) if value is not None and value != "" else None
+        return number if number is not None and math.isfinite(number) else None
     except (TypeError, ValueError): return None
 
 

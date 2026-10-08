@@ -1,3 +1,5 @@
+import asyncio
+import threading
 import importlib.util
 import math
 import os
@@ -17,7 +19,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .adapters import OpenBBClient, PaperclipReporter, TradingAgentsClient, research_symbol
+from .adapters import (OpenBBClient, PaperclipReporter, TradingAgentsClient, research_symbol,
+                       WeexSpotMarketData, WeexFuturesMarketData)
 from .analysis import (CandleCache, DeepJobRegistry, FastAIExplainer, QuickResultCache,
                        QuickSignalEngine, TIMEFRAMES, deterministic_fast_explanation,
                        normalize_deep_reasoning)
@@ -31,6 +34,7 @@ from .execution import PaperBroker
 from .models import MarketKind, MarketSelection, MarketSnapshot
 from .overview import market_overview
 from .weex_universe import weex_universes
+from .background import LocalState, Scanner, PaperMonitor
 from .paper import PaperStore
 from .risk import RiskEngine, RiskLimits
 from .service import TradingService
@@ -410,13 +414,20 @@ def startup_diagnostics() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     startup_diagnostics()
-    yield
+    for job in (_app.state.scanner, _app.state.paper_monitor):
+        job.start()
+    try:
+        yield
+    finally:
+        await asyncio.gather(*(asyncio.to_thread(job.stop) for job in (_app.state.scanner, _app.state.paper_monitor)))
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Signal", version="0.4.0", lifespan=lifespan)
     paper = PaperStore()
     app.state.paper_store = paper
+    local_state = LocalState(paper.path)
+    refresh_lock = threading.Lock()
     app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
 
     @app.get("/")
@@ -433,7 +444,8 @@ def create_app() -> FastAPI:
 
     @app.get("/api/status")
     def status():
-        return {"mode": "paper", "integrations": integration_status()}
+        return {"mode": "paper", "integrations": integration_status(),
+                "scanner": scanner_status(), "paper_monitor": monitor_status()}
 
     @app.get("/debug")
     def debug():
@@ -573,8 +585,12 @@ def create_app() -> FastAPI:
 
     @app.post("/api/analyze/quick")
     def quick_analyze(request: AnalyzeRequest):
+        return _quick_analyze(request)
+
+    def _quick_analyze(request: AnalyzeRequest, provider=None, report=True):
+        strict_provider = provider is not None
         try:
-            provider = market_data(request)
+            provider = provider or market_data(request)
             symbol = request.symbol.upper()
             snapshot = provider.snapshot(symbol)
             histories, warnings = {}, []
@@ -583,7 +599,7 @@ def create_app() -> FastAPI:
             timeframes = (("5m", "15m", "1h", "1d")
                           if request.market is MarketKind.INDIAN_INDICES else TIMEFRAMES)
             executor = ThreadPoolExecutor(max_workers=len(timeframes), thread_name_prefix="quick-candles")
-            futures = {executor.submit(candle_cache.get_or_load, f"{request.market.value}:{symbol}", frame,
+            futures = {executor.submit(candle_cache.get_or_load, f"{'weex-only:' if strict_provider else ''}{request.market.value}:{symbol}", frame,
                        lambda f=frame: provider.candles(symbol, f, 250), request.refresh): frame
                        for frame in timeframes}
             candle_timeout = max(.05, float(os.getenv("SIGNAL_QUICK_CANDLE_TIMEOUT_SECONDS", "8")))
@@ -632,9 +648,10 @@ def create_app() -> FastAPI:
             result["stale_after_seconds"] = _freshness_threshold(request.market)
             result["advanced_research_availability"] = advanced_research_availability(request, result)
             quick_results.put(request.market.value, symbol, result)
-            PaperclipReporter().report({"event": "quick_signal_completed", "market": request.market.value,
-                                        "symbol": symbol, "action": str(result["signal"].get("side"))},
-                                       f"quick:{request.market.value}:{symbol}:{snapshot.as_of}")
+            if report:
+                PaperclipReporter().report({"event": "quick_signal_completed", "market": request.market.value,
+                                            "symbol": symbol, "action": str(result["signal"].get("side"))},
+                                           f"quick:{request.market.value}:{symbol}:{snapshot.as_of}")
             return result
         except Exception as exc:
             if os.getenv("SIGNAL_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
@@ -732,31 +749,101 @@ def create_app() -> FastAPI:
         return deep_jobs.start(request.market.value, request.symbol, perform, fallback,
                                refresh=request.refresh)
 
-    def _paper_quote(market: str, symbol: str) -> float:
+    def _paper_snapshot(market: str, symbol: str, strict=False):
         selection = MarketSelection(MarketKind(market), "weex" if market.startswith("crypto_") else "openbb",
                                     symbol.upper())
-        price = float(default_registry().market_data(selection).snapshot(symbol.upper()).price)
+        provider = (WeexFuturesMarketData() if market == "crypto_futures" else WeexSpotMarketData()) if strict and market.startswith("crypto_") else default_registry().market_data(selection)
+        snapshot = provider.snapshot(symbol.upper())
+        price = float(snapshot.price)
         if not math.isfinite(price) or price <= 0:
             raise ValueError("Live price is missing or invalid")
-        return price
+        if strict and isinstance(snapshot.as_of, str):
+            timestamp = datetime.fromisoformat(snapshot.as_of.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None or (datetime.now(timezone.utc) - timestamp).total_seconds() > _freshness_threshold(MarketKind(market)):
+                raise ValueError("Provider quote is stale")
+        return snapshot
+
+    def _paper_quote(market: str, symbol: str) -> float:
+        return float(_paper_snapshot(market, symbol).price)
 
     def _mark_open_positions() -> list[dict]:
-        for position in paper.positions():
-            try:
-                paper.mark(position["id"], _paper_quote(position["market"], position["symbol"]))
-                marked = next((item for item in paper.positions() if item["id"] == position["id"]), None)
-                reason = paper.trigger_reason(marked) if marked else None
-                auto_close = os.getenv("PAPER_AUTO_CLOSE_STOPS", "true").strip().lower() not in {"0", "false", "no", "off"}
-                if reason and auto_close:
-                    paper.close_position(position["id"], marked[reason], reason)
-            except KeyError:
-                # Another simultaneous dashboard request already closed this position.
-                pass
-            except Exception as exc:
-                # Preserve the last valid mark when a provider is temporarily unavailable.
-                paper.mark_unavailable(position["id"])
-                diagnostics.failure("paper_quote", exc)
-        return paper.positions()
+        # Serialize background and manual refreshes; SQLite serializes all closes.
+        with refresh_lock:
+            for position in paper.positions():
+                if monitor.stop_event.is_set():
+                    break
+                try:
+                    snapshot = _paper_snapshot(position["market"], position["symbol"], strict=True)
+                    price = float(snapshot.price)
+                    provider = snapshot.source if isinstance(snapshot.source, str) else "public market provider"
+                    paper.mark(position["id"], price, provider=provider)
+                    marked = {**position, "current_price": price}
+                    reason = paper.trigger_reason(marked)
+                    auto_close = os.getenv("PAPER_AUTO_CLOSE_STOPS", "true").strip().lower() not in {"0", "false", "no", "off"}
+                    if reason and auto_close:
+                        # Preserve existing simulated threshold fills; separately record the genuine evaluated quote.
+                        paper.close_position(position["id"], marked[reason], reason, provider=provider, evaluated_price=price)
+                except KeyError:
+                    pass
+                except Exception as exc:
+                    paper.mark_unavailable(position["id"])
+                    diagnostics.failure("paper_quote", exc)
+            positions = paper.positions()
+            stale = any(not p.get("price_available", True) for p in positions)
+            with monitor.state_lock:
+                monitor.state["stale"] = stale
+                if not stale:
+                    monitor.state["last_successful_evaluation"] = datetime.now(timezone.utc).isoformat()
+            return positions
+
+    scanner_quick_results = QuickResultCache()
+
+    def scanner_analyze(market, symbol):
+        cached = scanner_quick_results.get(market.value, symbol)
+        expected_source = "weex_spot_v3" if market is MarketKind.CRYPTO_SPOT else "weex_futures_v3"
+        if cached and cached.get("source") == expected_source:
+            return cached
+        provider = WeexSpotMarketData() if market is MarketKind.CRYPTO_SPOT else WeexFuturesMarketData()
+        # Research fallbacks may represent a different venue. Scanner candles and
+        # snapshots must remain WEEX-only and use an isolated candle cache key.
+        result = _quick_analyze(AnalyzeRequest(market=market, symbol=symbol, venue="weex"), provider, report=False)
+        scanner_quick_results.put(market.value, symbol, result)
+        return result
+
+    scanner = Scanner(local_state, weex_universes, scanner_analyze,
+                      candidates=int(os.getenv("SCANNER_CANDIDATES_PER_MARKET", "12")),
+                      concurrency=int(os.getenv("SCANNER_CONCURRENCY", "2")))
+    monitor = PaperMonitor(local_state, _mark_open_positions)
+    app.state.scanner, app.state.paper_monitor = scanner, monitor
+
+    @app.get("/api/scanner/status")
+    def scanner_status():
+        return {**scanner.status(), "stale": scanner.latest()["stale"]}
+
+    @app.get("/api/scanner/results")
+    def scanner_results():
+        return scanner.latest()
+
+    @app.post("/api/scanner/run", status_code=202)
+    def scanner_run():
+        if not scanner.request_run():
+            raise HTTPException(409, "A scan is already running or shutting down")
+        return {"accepted": True, "status": scanner.status()}
+
+    @app.get("/api/paper/monitor/status")
+    def monitor_status():
+        return {**monitor.status(), "next_evaluation": monitor.status()["next_scan"]}
+
+    @app.get("/api/paper/settings")
+    def paper_settings():
+        return local_state.settings()
+
+    @app.put("/api/paper/settings")
+    def update_paper_settings(changes: dict):
+        try:
+            return local_state.update_settings(changes)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     @app.get("/api/paper/account")
     def paper_account():
@@ -806,7 +893,7 @@ def create_app() -> FastAPI:
         try:
             opened = paper.open_position(market=request.market.value, symbol=request.symbol,
                     display_name=quick.get("display_name") or request.symbol.upper(), side=side,
-                    price=price, notional=notional, signal=quick, risk_plan=plan)
+                    price=price, notional=notional, signal=quick, risk_plan=plan, settings=local_state.settings())
             PaperclipReporter().report({"event": "paper_position_opened", "market": request.market.value,
                                         "symbol": request.symbol.upper(), "position_id": opened.get("id")},
                                        f"paper-open:{opened.get('id')}")
